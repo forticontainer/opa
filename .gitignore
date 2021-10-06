@@ -7,6 +7,7 @@
 
 # build artifacts
 coverage.txt
+opa
 opa_*
 .Dockerfile_*
 _release
