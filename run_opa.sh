@@ -1,22 +1,25 @@
 #!/bin/bash
 
+# $1 OPA executable dir, $2 OPA listen port
+# both are optional and have default values
+
 # setup OPA directory and check OPA executable
-if [ -z "$2" ]
+if [ -z "$1" ]
 then
     opa_dir=/opt/fortics/fcs-worker
 else
-    opa_dir=$2
+    opa_dir=$1
 fi
 
 opa_executable=$opa_dir/opa
-if [ -e opa_executable ]
+if [ ! -e $opa_executable ]
 then
     echo "cannot locate opa executable from $opa_executable"
     exit 1
 fi
 
 # run OPA
-if [ -z "$1" ]
+if [ -z "$2" ]
 then
     echo "running OPA on default port"
     $opa_executable run --server > /dev/null 2>&1 &
