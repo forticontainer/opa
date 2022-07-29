@@ -7,6 +7,8 @@ package topdown
 import (
 	"context"
 	"fmt"
+	"os"
+	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -17,8 +19,27 @@ import (
 	"github.com/open-policy-agent/opa/test/cases"
 )
 
+var x508Exceptions = []string{
+	"cryptox509parsecertificates/invalid DER or PEM data, b64",
+}
+
+func isException(note string) bool {
+	for _, exc := range x508Exceptions {
+		if note == exc {
+			return true
+		}
+	}
+	return false
+}
+
 func TestRego(t *testing.T) {
 	for _, tc := range cases.MustLoad("../test/cases/testdata").Sorted().Cases {
+		if strings.HasPrefix(runtime.Version(), "go1.16") && isException(tc.Note) {
+			t.Run(tc.Note, func(t *testing.T) {
+				t.Skip("skipped for go1.16, x509 errors differ")
+			})
+			continue
+		}
 		t.Run(tc.Note, func(t *testing.T) {
 			testRun(t, tc)
 		})
@@ -67,12 +88,14 @@ func testRun(t *testing.T, tc cases.TestCase) {
 		input = ast.NewTerm(ast.MustInterfaceToValue(*tc.Input))
 	}
 
+	buf := NewBufferTracer()
 	rs, err := NewQuery(query).
 		WithCompiler(compiler).
 		WithStore(store).
 		WithTransaction(txn).
 		WithInput(input).
 		WithStrictBuiltinErrors(tc.StrictError).
+		WithTracer(buf).
 		Run(ctx)
 
 	if tc.WantError != nil {
@@ -93,6 +116,10 @@ func testRun(t *testing.T, tc cases.TestCase) {
 
 	if tc.WantResult == nil && tc.WantErrorCode == nil && tc.WantError == nil {
 		t.Fatal("expected one of: 'want_result', 'want_error_code', or 'want_error'")
+	}
+
+	if testing.Verbose() {
+		PrettyTrace(os.Stderr, *buf)
 	}
 }
 

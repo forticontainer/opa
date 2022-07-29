@@ -26,19 +26,13 @@ typedef uint8_t wasmtime_strategy_t;
  * The default value is #WASMTIME_STRATEGY_AUTO.
  */
 enum wasmtime_strategy_enum { // Strategy
-  /// Wasmtime will automatically determine whether to use Cranelift or
-  /// Lightbeam, and currently it will always pick Cranelift. This default may
-  /// change over time though.
+  /// Automatically picks the compilation backend, currently always defaulting
+  /// to Cranelift.
   WASMTIME_STRATEGY_AUTO,
 
-  /// Indicates that Cranelift will unconditionally use Cranelift to compile
+  /// Indicates that Wasmtime will unconditionally use Cranelift to compile
   /// WebAssembly code.
   WASMTIME_STRATEGY_CRANELIFT,
-
-  /// Indicates that Cranelift will unconditionally use Lightbeam to compile
-  /// WebAssembly code. Note that Lightbeam isn't always enabled at compile
-  /// time, and if that's the case an error will be returned.
-  WASMTIME_STRATEGY_LIGHTBEAM,
 };
 
 /**
@@ -103,15 +97,6 @@ enum wasmtime_profiling_strategy_enum { // ProfilingStrategy
 WASMTIME_CONFIG_PROP(void, debug_info, bool)
 
 /**
- * \brief Enables WebAssembly code to be interrupted.
- *
- * This setting is `false` by default. When enabled it will enable getting an
- * interrupt handle via #wasmtime_interrupt_handle_new which can be used to
- * interrupt currently-executing WebAssembly code.
- */
-WASMTIME_CONFIG_PROP(void, interruptable, bool)
-
-/**
  * \brief Whether or not fuel is enabled for generated code.
  *
  * This setting is `false` by default. When enabled it will enable fuel counting
@@ -119,6 +104,22 @@ WASMTIME_CONFIG_PROP(void, interruptable, bool)
  * and trap when reaching zero.
  */
 WASMTIME_CONFIG_PROP(void, consume_fuel, bool)
+
+/**
+ * \brief Whether or not epoch-based interruption is enabled for generated code.
+ *
+ * This setting is `false` by default. When enabled wasm code will check the
+ * current epoch periodically and abort if the current epoch is beyond a
+ * store-configured limit.
+ *
+ * Note that when this setting is enabled all stores will immediately trap and
+ * need to have their epoch deadline otherwise configured with
+ * #wasmtime_context_set_epoch_deadline.
+ *
+ * Note that the current epoch is engine-local and can be incremented with
+ * #wasmtime_engine_increment_epoch.
+ */
+WASMTIME_CONFIG_PROP(void, epoch_interruption, bool)
 
 /**
  * \brief Configures the maximum stack size, in bytes, that JIT code can use.
@@ -183,14 +184,6 @@ WASMTIME_CONFIG_PROP(void, wasm_multi_value, bool)
  * This setting is `false` by default.
  */
 WASMTIME_CONFIG_PROP(void, wasm_multi_memory, bool)
-
-/**
- * \brief Configures whether the WebAssembly module linking proposal is
- * enabled.
- *
- * This setting is `false` by default.
- */
-WASMTIME_CONFIG_PROP(void, wasm_module_linking, bool)
 
 /**
  * \brief Configures whether the WebAssembly memory64 proposal is

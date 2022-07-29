@@ -90,7 +90,7 @@ docker run -v $PWD:/example openpolicyagent/opa eval -d /example 'data.example.g
 ```live:docker_hello_world:module:read_only
 package example
 
-greeting = msg {
+greeting := msg {
     info := opa.runtime()
     hostname := info.env["HOSTNAME"] # Docker sets the HOSTNAME environment variable.
     msg := sprintf("hello from container %q!", [hostname])
@@ -154,7 +154,7 @@ we recommend you store it as a Secret.
 ```live:k8s_deployment_hello_world:module:read_only
 package example
 
-greeting = msg {
+greeting := msg {
     info := opa.runtime()
     hostname := info.env["HOSTNAME"] # Kubernetes sets the HOSTNAME environment variable.
     msg := sprintf("hello from pod %q!", [hostname])
@@ -443,11 +443,48 @@ When passing a capabilities definition file via `--capabilities`, one can restri
 
 Not providing a capabilities file, or providing a file without an `allow_net` key, will permit fetching remote schemas from any host.
 
-Note that the metaschemas http://json-schema.org/draft-04/schema, http://json-schema.org/draft-06/schema, and http://json-schema.org/draft-07/schema, are always available, even without network access.
+Note that the metaschemas [http://json-schema.org/draft-04/schema](http://json-schema.org/draft-04/schema), [http://json-schema.org/draft-06/schema](http://json-schema.org/draft-06/schema), and [http://json-schema.org/draft-07/schema](http://json-schema.org/draft-07/schema), are always available, even without network access.
+
+Similarly, the `allow_net` capability restricts what hosts the `http.send` built-in function may send requests to, and what hosts the `net.lookup_ip_addr` built-in function may resolve IP addresses for.
+
+### Future keywords
+
+The availability of future keywords in an OPA version can also be controlled using the capabilities file:
+
+```json
+{
+    "future_keywords": [ "in" ]
+}
+```
+
+With these capabilities, the future import `future.keywords.in` would be available. See [the documentation
+of the membership and iteration operator for details](../policy-language/#membership-and-iteration-in).
+
+### Wasm ABI compatibility
+
+A specific OPA version's capabilities file shows which Wasm ABI versions it is capable of evaluating:
+
+```json
+{
+    "wasm_abi_versions": [
+        {
+            "version": 1,
+            "minor_version": 1
+        },
+        {
+            "version": 1,
+            "minor_version": 2
+        }
+   ]
+}
+```
+
+This snippet would allow for evaluating bundles containing Wasm modules of the ABI version 1.1 and 1.2.
+See [the ABI version docs](../wasm/#abi-versions) for details.
 
 ### Building your own capabilities JSON
 
-Use the following JSON structure to build more complex capability checks. 
+Use the following JSON structure to build more complex capability checks.
 
 ```json
 {
@@ -459,11 +496,11 @@ Use the following JSON structure to build more complex capability checks.
 
             "decl": {  // REQUIRED: Built-in function type declaration.
 
-                "type": "function", // REQUIRED: states this is a function 
+                "type": "function", // REQUIRED: states this is a function
 
-                "args": [ // REQUIRED: List of types to be passed in as an arguement: any, number, string, boolean, object, array, set. 
+                "args": [ // REQUIRED: List of types to be passed in as an arguement: any, number, string, boolean, object, array, set.
                     {
-                        "type": "number" 
+                        "type": "number"
                     },
                     {
                         "type": "number"
@@ -478,6 +515,7 @@ Use the following JSON structure to build more complex capability checks.
     "allow_net": [ // OPTIONAL: allow_net is an array of hostnames or IP addresses, that an OPA instance is allowed to connect to.
       "mycompany.com",
       "database.safe",
-    ]
+    ],
+    "future_keywords": [ "in" ]
 }
 ```

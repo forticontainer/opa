@@ -9,6 +9,9 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"os"
+	"path/filepath"
+	"strings"
 	"sync"
 
 	"github.com/open-policy-agent/opa/ast"
@@ -37,7 +40,7 @@ type Discovery struct {
 	manager      *plugins.Manager
 	config       *Config
 	factories    map[string]plugins.Factory
-	downloader   *download.Downloader                // discovery bundle downloader
+	downloader   bundle.Loader                       // discovery bundle downloader
 	status       *bundle.Status                      // discovery status
 	listenersMtx sync.Mutex                          // lock for listener map
 	listeners    map[interface{}]func(bundle.Status) // listeners for discovery update events
@@ -84,13 +87,23 @@ func New(manager *plugins.Manager, opts ...func(*Discovery)) (*Discovery, error)
 		return result, nil
 	}
 
-	if manager.Config.PluginsEnabled() {
-		return nil, fmt.Errorf("plugins cannot be specified in the bootstrap configuration when discovery enabled")
+	if names := manager.Config.PluginNames(); len(names) > 0 {
+		return nil, fmt.Errorf("discovery prohibits manual configuration of %v", strings.Join(names, " and "))
 	}
 
 	result.config = config
-	result.downloader = download.New(config.Config, manager.Client(config.service), config.path).WithCallback(result.oneShot).
-		WithBundleVerificationConfig(config.Signing)
+	restClient := manager.Client(config.service)
+	if strings.ToLower(restClient.Config().Type) == "oci" {
+		ociStorePath := filepath.Join(os.TempDir(), "opa", "oci") // use temporary folder /tmp/opa/oci
+		if manager.Config.PersistenceDirectory != nil {
+			ociStorePath = filepath.Join(*manager.Config.PersistenceDirectory, "oci")
+		}
+		result.downloader = download.NewOCI(config.Config, restClient, config.path, ociStorePath).WithCallback(result.oneShot).
+			WithBundleVerificationConfig(config.Signing)
+	} else {
+		result.downloader = download.New(config.Config, restClient, config.path).WithCallback(result.oneShot).
+			WithBundleVerificationConfig(config.Signing)
+	}
 	result.status = &bundle.Status{
 		Name: Name,
 	}
@@ -141,6 +154,9 @@ func (c *Discovery) TriggerMode() *plugins.TriggerMode {
 }
 
 func (c *Discovery) Trigger(ctx context.Context) error {
+	if c.downloader == nil {
+		return nil
+	}
 	return c.downloader.Trigger(ctx)
 }
 
@@ -184,6 +200,7 @@ func (c *Discovery) processUpdate(ctx context.Context, u download.Update) {
 	c.status.LastSuccessfulRequest = c.status.LastRequest
 
 	if u.Bundle != nil {
+		c.status.Type = u.Bundle.Type()
 		c.status.LastSuccessfulDownload = c.status.LastSuccessfulRequest
 
 		if err := c.reconfigure(ctx, u); err != nil {
@@ -253,7 +270,7 @@ func (c *Discovery) processBundle(ctx context.Context, b *bundleApi.Bundle) (*pl
 		Raw:        config.Services,
 		AuthPlugin: c.manager.AuthPlugin,
 		Keys:       c.manager.PublicKeys(),
-		Logger:     c.logger.WithFields(c.manager.Client(c.config.service).Logger().GetFields()),
+		Logger:     c.logger.WithFields(c.manager.Client(c.config.service).LoggerFields()),
 	}
 	services, err := cfg.ParseServicesConfig(opts)
 	if err != nil {
@@ -273,10 +290,12 @@ func (c *Discovery) processBundle(ctx context.Context, b *bundleApi.Bundle) (*pl
 		return nil, err
 	}
 
-	for key, kc := range keys {
-		if curr, ok := c.config.Signing.PublicKeys[key]; ok {
-			if !curr.Equal(kc) {
-				return nil, fmt.Errorf("updates to keys specified in the boot configuration are not allowed")
+	if c.config.Signing != nil {
+		for key, kc := range keys {
+			if curr, ok := c.config.Signing.PublicKeys[key]; ok {
+				if !curr.Equal(kc) {
+					return nil, fmt.Errorf("updates to keys specified in the boot configuration are not allowed")
+				}
 			}
 		}
 	}

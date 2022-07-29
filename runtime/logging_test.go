@@ -6,224 +6,167 @@
 package runtime
 
 import (
-	"encoding/json"
-	"errors"
-	"fmt"
+	"context"
+	"net/http"
+	"net/http/httptest"
 	"net/url"
 	"strings"
 	"testing"
 
-	"github.com/sirupsen/logrus"
+	"github.com/open-policy-agent/opa/logging"
+	"github.com/open-policy-agent/opa/logging/test"
 )
 
-func TestDropInputParam(t *testing.T) {
+func TestValidateGzipHeader(t *testing.T) {
 
-	// Without other params.
-	abc := `a.b.c:{"foo":[1,2,3,4]}`
-	abcEncoded := url.QueryEscape(abc)
-
-	uri, err := url.ParseRequestURI(fmt.Sprintf(`http://localhost:8181/v1/data/foo/bar?input=%v`, abcEncoded))
-	if err != nil {
-		panic(err)
-	}
-
-	result := dropInputParam(uri)
-	expected := "/v1/data/foo/bar"
-
-	if result != expected {
+	httpHeader := http.Header{}
+	httpHeader.Add("Accept", "*/*")
+	if result, expected := gzipAccepted(httpHeader), false; result != expected {
 		t.Errorf("Expected %v but got: %v", expected, result)
 	}
 
-	// With other params.
-	def := `d.e.f:{"bar":{"baz":null}}`
-	defEncoded := url.QueryEscape(def)
-
-	uri, err = url.ParseRequestURI(fmt.Sprintf(`http://localhost:8181/v1/data/foo/bar?input=%v&pretty=true&depth=1&input=%v`, abcEncoded, defEncoded))
-	if err != nil {
-		panic(err)
-	}
-
-	result = dropInputParam(uri)
-	expected = "/v1/data/foo/bar?depth=1&pretty=true"
-
-	if result != expected {
+	httpHeader.Add("Accept-Encoding", "gzip")
+	if result, expected := gzipAccepted(httpHeader), true; result != expected {
 		t.Errorf("Expected %v but got: %v", expected, result)
 	}
 
+	httpHeader.Set("Accept-Encoding", "gzip, deflate, br")
+	if result, expected := gzipAccepted(httpHeader), true; result != expected {
+		t.Errorf("Expected %v but got: %v", expected, result)
+	}
+
+	httpHeader.Set("Accept-Encoding", "br;q=1.0, gzip;q=0.8, *;q=0.1")
+	if result, expected := gzipAccepted(httpHeader), true; result != expected {
+		t.Errorf("Expected %v but got: %v", expected, result)
+	}
 }
 
-func TestPrettyFormatterNoFields(t *testing.T) {
-	fmtr := prettyFormatter{}
+func TestValidatePprofUrl(t *testing.T) {
 
-	e := logrus.NewEntry(logrus.StandardLogger())
-	e.Message = "test"
-	e.Level = logrus.InfoLevel
+	req := http.Request{}
 
-	out, err := fmtr.Format(e)
+	req.URL = &url.URL{Path: "/metrics"}
+	if result, expected := isPprofEndpoint(&req), false; result != expected {
+		t.Errorf("Expected %v but got: %v", expected, result)
+	}
+
+	req.URL = &url.URL{Path: "/debug/pprof/"}
+	if result, expected := isPprofEndpoint(&req), true; result != expected {
+		t.Errorf("Expected %v but got: %v", expected, result)
+	}
+}
+
+func TestValidateMetricsUrl(t *testing.T) {
+
+	req := http.Request{}
+
+	req.URL = &url.URL{Path: "/metrics"}
+	if result, expected := isMetricsEndpoint(&req), true; result != expected {
+		t.Errorf("Expected %v but got: %v", expected, result)
+	}
+
+	req.URL = &url.URL{Path: "/debug/pprof/"}
+	if result, expected := isMetricsEndpoint(&req), false; result != expected {
+		t.Errorf("Expected %v but got: %v", expected, result)
+	}
+}
+
+func TestRequestLogging(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	logger := test.New()
+	logger.SetLevel(logging.Debug)
+
+	shutdownSeconds := 1
+	params := NewParams()
+	params.Addrs = &[]string{":0"}
+	params.Logger = logger
+	params.PprofEnabled = true
+	params.GracefulShutdownPeriod = shutdownSeconds // arbitrary, must be non-zero
+
+	rt, err := NewRuntime(ctx, params)
 	if err != nil {
-		t.Fatalf("Unexpected error formatting log entry: %s", err.Error())
+		t.Fatal(err)
 	}
 
-	actualStr := string(out)
-
-	expectedLvl := strings.ToUpper(e.Level.String())
-	if !strings.Contains(actualStr, expectedLvl) {
-		t.Errorf("Expected log message to have level %s:\n%s", expectedLvl, actualStr)
-	}
-
-	if !strings.Contains(actualStr, "test") {
-		t.Errorf("Expected log message to have the entry message '%s':\n%s", "test", actualStr)
-	}
-}
-
-func TestPrettyFormatterBasicFields(t *testing.T) {
-	fmtr := prettyFormatter{}
-
-	e := logrus.WithFields(logrus.Fields{
-		"number": 5,
-		"string": "field_string",
-		"nil":    nil,
-		"error":  errors.New("field_error").Error(),
-	})
-
-	e.Message = "test"
-	e.Level = logrus.InfoLevel
-
-	out, err := fmtr.Format(e)
-	if err != nil {
-		t.Fatalf("Unexpected error formatting log entry: %s", err.Error())
-	}
-
-	actualStr := string(out)
-
-	expectedLvl := strings.ToUpper(e.Level.String())
-	if !strings.Contains(actualStr, expectedLvl) {
-		t.Errorf("Expected log message to have level %s:\n%s", expectedLvl, actualStr)
-	}
-
-	if !strings.Contains(actualStr, "test\n") {
-		t.Errorf("Expected log message to have the entry message '%s':\n%s", "test", actualStr)
-	}
-
-	if !strings.Contains(actualStr, "number = 5\n") {
-		t.Errorf("Expected to have the number field in message")
-	}
-
-	if !strings.Contains(actualStr, "string = \"field_string\"\n") {
-		t.Errorf("Expected to have the string field in message")
-	}
-
-	if !strings.Contains(actualStr, "nil = null\n") {
-		t.Errorf("Expected to have the nil field in message")
-	}
-
-	if !strings.Contains(actualStr, "error = \"field_error\"\n") {
-		t.Errorf("Expected to have the nil field in message")
-	}
-
-	expectedLines := 7 // one for the message, 4 fields (one line each), and two trailing \n
-	actualLines := len(strings.Split(actualStr, "\n"))
-	if actualLines != expectedLines {
-		t.Errorf("Expected %d lines in output, found %d\n Output: \n%s\n", expectedLines, actualLines, actualStr)
-	}
-}
-
-func TestPrettyFormatterMultilineStringFields(t *testing.T) {
-	fmtr := prettyFormatter{}
-
-	mlStr := `
-package opa.examples
-
-import data.servers
-import data.networks
-import data.ports
-
-public_servers[server] {
-	server := servers[_]
-	server.ports[_] == ports[k].id
-	ports[k].networks[_] == networks[m].id
-	networks[m].public == true
-}
-`
-
-	e := logrus.WithFields(logrus.Fields{
-		"multi_line": mlStr,
-	})
-
-	e.Message = "test"
-	e.Level = logrus.InfoLevel
-
-	out, err := fmtr.Format(e)
-	if err != nil {
-		t.Fatalf("Unexpected error formatting log entry: %s", err.Error())
-	}
-
-	actualStr := string(out)
-
-	expectedLvl := strings.ToUpper(e.Level.String())
-	if !strings.Contains(actualStr, expectedLvl) {
-		t.Errorf("Expected log message to have level %s:\n%s", expectedLvl, actualStr)
-	}
-
-	if !strings.Contains(actualStr, "test") {
-		t.Errorf("Expected log message to have the entry message '%s':\n%s", "test", actualStr)
-	}
-
-	for _, line := range strings.Split(mlStr, "\n") {
-		// The lines will get prefixed with some padding but should always
-		// still have their real newlines, and not be encoded.
-		expectedStr := line + "\n"
-		if !strings.Contains(actualStr, expectedStr) {
-			t.Errorf("Expected to find line in message:\n\n%s\n\nactual:\n\n%s\n", expectedStr, actualStr)
+	initChannel := rt.Manager.ServerInitializedChannel()
+	go func() {
+		if err := rt.Serve(ctx); err != nil {
+			t.Error(err)
 		}
-	}
-}
+	}()
+	<-initChannel
 
-func TestPrettyFormatterMultilineJSONFields(t *testing.T) {
-	fmtr := prettyFormatter{}
-
-	obj := map[string]interface{}{
-		"a": 123,
-		"b": nil,
-		"d": "abc",
-		"e": map[string]interface{}{
-			"test": []string{
-				"aa",
-				"bb",
-				"cc",
-			},
+	tests := []struct {
+		path           string
+		acceptEncoding string
+		expected       string
+	}{
+		{
+			"/metrics", "gzip", "[compressed payload]",
+		},
+		{
+			"/metrics", "*/*", "HELP go_gc_duration_seconds A summary of the pause duration of garbage collection cycles.", // rest omitted
+		},
+		{ // accept-encoding does not matter for "our" handlers -- they don't compress
+			"/v1/data", "gzip", "{\"result\":{}}",
+		},
+		{ // accept-encoding does not matter for pprof: it's always protobuf
+			"/debug/pprof/cmdline", "*/*", "[binary payload]",
 		},
 	}
 
-	e := logrus.WithFields(logrus.Fields{
-		"json_string": obj,
-	})
-
-	e.Message = "test"
-	e.Level = logrus.InfoLevel
-
-	out, err := fmtr.Format(e)
-	if err != nil {
-		t.Fatalf("Unexpected error formatting log entry: %s", err.Error())
+	// execute all the requests
+	for _, tc := range tests {
+		rec := httptest.NewRecorder()
+		req, err := http.NewRequest("GET", tc.path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Accept-Encoding", tc.acceptEncoding)
+		rt.server.Handler.ServeHTTP(rec, req)
+		if exp, act := http.StatusOK, rec.Result().StatusCode; exp != act {
+			t.Errorf("GET %s: expected HTTP %d, got %d", tc.path, exp, act)
+		}
 	}
 
-	actualStr := string(out)
+	cancel()
 
-	expectedLvl := strings.ToUpper(e.Level.String())
-	if !strings.Contains(actualStr, expectedLvl) {
-		t.Errorf("Expected log message to have level %s:\n%s", expectedLvl, actualStr)
-	}
+	// check the logs
+	ents := logger.Entries()
+	for j, tc := range tests {
+		i := uint64(j + 1)
+		found := false
+		for _, ent := range entriesForReq(ents, i) {
+			if ent.Message == "Sent response." {
+				act := ent.Fields["resp_body"].(string)
+				if !strings.Contains(act, tc.expected) {
+					t.Errorf("expected %q in resp_body field, got %q", tc.expected, act)
+				}
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("Expected \"Sent response.\" log for request %d (path %s)", j, tc.path)
+		}
 
-	if !strings.Contains(actualStr, "test") {
-		t.Errorf("Expected log message to have the entry message 'test':\n%s", actualStr)
 	}
+	if t.Failed() {
+		t.Logf("logs: %v", ents)
+	}
+}
 
-	expectedJSON, err := json.MarshalIndent(&obj, "      ", "  ")
-	if err != nil {
-		t.Fatalf("Unexpected error: %v", err)
+func entriesForReq(ents []test.LogEntry, n uint64) []test.LogEntry {
+	var ret []test.LogEntry
+	for _, e := range ents {
+		if r, ok := e.Fields["req_id"]; ok {
+			if i, ok := r.(uint64); ok {
+				if i == n {
+					ret = append(ret, e)
+				}
+			}
+		}
 	}
-
-	if !strings.Contains(actualStr, string(expectedJSON)) {
-		t.Errorf("Expected JSON to be formatted and included in message:\n\nExpected:\n%s\n\nActual:\n%s\n\n", string(expectedJSON), actualStr)
-	}
+	return ret
 }

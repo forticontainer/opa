@@ -24,6 +24,7 @@ var checkParams = struct {
 	bundleMode   bool
 	capabilities *capabilitiesFlag
 	schema       *schemaFlags
+	strict       bool
 }{
 	format: util.NewEnumFlag(checkFormatPretty, []string{
 		checkFormatPretty, checkFormatJSON,
@@ -111,7 +112,9 @@ func checkModules(args []string) int {
 	compiler := ast.NewCompiler().
 		SetErrorLimit(checkParams.errLimit).
 		WithCapabilities(capabilities).
-		WithSchemas(ss)
+		WithSchemas(ss).
+		WithEnablePrintStatements(true).
+		WithStrict(checkParams.strict)
 
 	compiler.Compile(modules)
 
@@ -153,5 +156,6 @@ func init() {
 	addBundleModeFlag(checkCommand.Flags(), &checkParams.bundleMode, false)
 	addCapabilitiesFlag(checkCommand.Flags(), checkParams.capabilities)
 	addSchemaFlags(checkCommand.Flags(), checkParams.schema)
+	addStrictFlag(checkCommand.Flags(), &checkParams.strict, false)
 	RootCommand.AddCommand(checkCommand)
 }

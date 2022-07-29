@@ -42,6 +42,7 @@ func generateCmdOutput(out io.Writer, check bool) {
 	fmt.Fprintln(out, "Build Timestamp: "+version.Timestamp)
 	fmt.Fprintln(out, "Build Hostname: "+version.Hostname)
 	fmt.Fprintln(out, "Go Version: "+version.GoVersion)
+	fmt.Fprintln(out, "Platform: "+version.Platform)
 
 	var wasmAvailable string
 
@@ -68,7 +69,7 @@ func checkOPAUpdate(out io.Writer) error {
 		return err
 	}
 
-	reporter, err := report.New(id)
+	reporter, err := report.New(id, report.Options{})
 	if err != nil {
 		return err
 	}

@@ -34,24 +34,22 @@ Create a policy that allows users to request their own salary as well as the sal
 package httpapi.authz
 
 # bob is alice's manager, and betty is charlie's.
-subordinates = {"alice": [], "charlie": [], "bob": ["alice"], "betty": ["charlie"]}
+subordinates := {"alice": [], "charlie": [], "bob": ["alice"], "betty": ["charlie"]}
 
-default allow = false
+default allow := false
 
 # Allow users to get their own salaries.
 allow {
-  some username
-  input.method == "GET"
-  input.path = ["finance", "salary", username]
-  input.user == username
+    input.method == "GET"
+    input.path == ["finance", "salary", input.user]
 }
 
 # Allow managers to get their subordinates' salaries.
 allow {
-  some username
-  input.method == "GET"
-  input.path = ["finance", "salary", username]
-  subordinates[input.user][_] == username
+    some username
+    input.method == "GET"
+    input.path = ["finance", "salary", username]
+    subordinates[input.user][_] == username
 }
 ```
 
@@ -206,14 +204,14 @@ package httpapi.authz
 
 # Allow HR members to get anyone's salary.
 allow {
-  input.method == "GET"
-  input.path = ["finance", "salary", _]
-  input.user == hr[_]
+    input.method == "GET"
+    input.path = ["finance", "salary", _]
+    input.user == hr[_]
 }
 
 # David is the only member of HR.
-hr = [
-  "david",
+hr := [
+    "david",
 ]
 ```
 
@@ -251,40 +249,40 @@ real world, let's try a similar exercise utilizing the JWT utilities of OPA.
 ```live:jwt_example:module:openable
 package httpapi.authz
 
-default allow = false
+default allow := false
 
 # Allow users to get their own salaries.
 allow {
-  some username
-  input.method == "GET"
-  input.path = ["finance", "salary", username]
-  token.payload.user == username
-  user_owns_token
+    some username
+    input.method == "GET"
+    input.path = ["finance", "salary", username]
+    token.payload.user == username
+    user_owns_token
 }
 
 # Allow managers to get their subordinate' salaries.
 allow {
-  some username
-  input.method == "GET"
-  input.path = ["finance", "salary", username]
-  token.payload.subordinates[_] == username
-  user_owns_token
+    some username
+    input.method == "GET"
+    input.path = ["finance", "salary", username]
+    token.payload.subordinates[_] == username
+    user_owns_token
 }
 
 # Allow HR members to get anyone's salary.
 allow {
-  input.method == "GET"
-  input.path = ["finance", "salary", _]
-  token.payload.hr == true
-  user_owns_token
+    input.method == "GET"
+    input.path = ["finance", "salary", _]
+    token.payload.hr == true
+    user_owns_token
 }
 
 # Ensure that the token was issued to the user supplying it.
 user_owns_token { input.user == token.payload.azp }
 
 # Helper to get the token payload.
-token = {"payload": payload} {
-  [header, payload, signature] := io.jwt.decode(input.token)
+token := {"payload": payload} {
+    [header, payload, signature] := io.jwt.decode(input.token)
 }
 ```
 

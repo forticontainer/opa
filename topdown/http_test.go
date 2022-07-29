@@ -29,6 +29,9 @@ import (
 	"github.com/open-policy-agent/opa/internal/version"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/topdown/builtins"
+	"github.com/open-policy-agent/opa/tracing"
+
+	iCache "github.com/open-policy-agent/opa/topdown/cache"
 
 	"github.com/open-policy-agent/opa/ast"
 )
@@ -73,10 +76,7 @@ func TestHTTPGetRequest(t *testing.T) {
 		"test-header":    []interface{}{"test-value"},
 	}
 
-	resultObj, err := ast.InterfaceToValue(expectedResult)
-	if err != nil {
-		panic(err)
-	}
+	resultObj := ast.MustInterfaceToValue(expectedResult)
 
 	// run the test
 	tests := []struct {
@@ -127,10 +127,7 @@ func TestHTTPGetRequestTlsInsecureSkipVerify(t *testing.T) {
 		"content-type":   []interface{}{"text/plain; charset=utf-8"},
 	}
 
-	resultObj, err := ast.InterfaceToValue(expectedResult)
-	if err != nil {
-		panic(err)
-	}
+	resultObj := ast.MustInterfaceToValue(expectedResult)
 
 	// run the test
 	tests := []struct {
@@ -140,7 +137,7 @@ func TestHTTPGetRequestTlsInsecureSkipVerify(t *testing.T) {
 		expectedError error
 	}{
 		{note: "http.send", rules: []string{fmt.Sprintf(
-			`p = x { http.send({"method": "get", "url": "%s", "force_json_decode": true}, x) }`, ts.URL)}, expected: &Error{Message: "x509: certificate signed by unknown authority"}},
+			`p = x { http.send({"method": "get", "url": "%s", "force_json_decode": true}, x) }`, ts.URL)}, expected: &Error{Message: fixupDarwinGo118("x509: certificate signed by unknown authority", `x509: “Acme Co” certificate is not trusted`)}},
 		{note: "http.send", rules: []string{fmt.Sprintf(
 			`p = x { http.send({"method": "get", "url": "%s", "force_json_decode": true, "tls_insecure_skip_verify": true}, resp); x := clean_headers(resp) }`, ts.URL)}, expected: resultObj.String()},
 		// This case verifies that `tls_insecure_skip_verify`
@@ -157,46 +154,144 @@ func TestHTTPGetRequestTlsInsecureSkipVerify(t *testing.T) {
 	}
 }
 
-func TestHTTPEnableJSONDecode(t *testing.T) {
+func TestHTTPEnableJSONOrYAMLDecode(t *testing.T) {
 
-	// test server
 	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		body := "*Hello World®"
-		fmt.Fprint(w, body)
+		switch r.URL.Path {
+		case "/json-no-header":
+			fmt.Fprintf(w, `{"foo":"bar"}`)
+		case "/yaml-no-header":
+			fmt.Fprintf(w, `foo: bar`)
+		case "/json":
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `{"foo":"bar"}`)
+		case "/yaml":
+			w.Header().Set("Content-Type", "application/yaml")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `foo: bar`)
+		case "/x-yaml":
+			w.Header().Set("Content-Type", "application/x-yaml")
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, `foo: bar`)
+		case "/text-no-header":
+			fmt.Fprintf(w, "*Hello World®")
+		}
 	}))
 
 	defer ts.Close()
 
-	// expected result
-	expectedResult := make(map[string]interface{})
-	expectedResult["status"] = "200 OK"
-	expectedResult["status_code"] = http.StatusOK
-	expectedResult["body"] = nil
-	expectedResult["raw_body"] = "*Hello World®"
-	expectedResult["headers"] = map[string]interface{}{
-		"content-length": []interface{}{"14"},
-		"content-type":   []interface{}{"text/plain; charset=utf-8"},
+	body := func(b interface{}) func(map[string]interface{}) {
+		return func(x map[string]interface{}) {
+			x["body"] = b
+		}
+	}
+	rawBody := func(b interface{}) func(map[string]interface{}) {
+		return func(x map[string]interface{}) {
+			x["raw_body"] = b
+		}
 	}
 
-	resultObj, err := ast.InterfaceToValue(expectedResult)
-	if err != nil {
-		panic(err)
+	headers := func(xs ...string) func(map[string]interface{}) {
+		hdrs := map[string]interface{}{}
+		for i := 0; i < len(xs)/2; i++ {
+			hdrs[xs[2*i]] = []interface{}{xs[2*i+1]}
+		}
+		return func(x map[string]interface{}) {
+			x["headers"] = hdrs
+		}
 	}
 
-	// run the test
+	ok := func(and ...func(map[string]interface{})) ast.Value {
+		o := map[string]interface{}{
+			"status":      "200 OK",
+			"status_code": http.StatusOK,
+		}
+		for _, a := range and {
+			a(o)
+		}
+		return ast.MustInterfaceToValue(o)
+	}
+
+	resultObjText := ok(
+		body(nil),
+		rawBody("*Hello World®"),
+		headers("content-length", "14", "content-type", "text/plain; charset=utf-8"),
+	)
+
 	tests := []struct {
 		note     string
-		rules    []string
-		expected interface{}
+		rule     string
+		expected ast.Value
 	}{
-		{"http.send", []string{fmt.Sprintf(
-			`p = x { http.send({"method": "get", "url": "%s", "force_json_decode": true}, resp); x := clean_headers(resp) }`, ts.URL)}, resultObj.String()},
+		{
+			note:     "text response, force json",
+			rule:     fmt.Sprintf(`p = x { http.send({"method": "get", "url": "%s/text-no-header", "force_json_decode": true}, resp); x := clean_headers(resp) }`, ts.URL),
+			expected: resultObjText,
+		},
+		{
+			note:     "text response, force yaml",
+			rule:     fmt.Sprintf(`p = x { http.send({"method": "get", "url": "%s/text-no-header", "force_yaml_decode": true}, resp); x := clean_headers(resp) }`, ts.URL),
+			expected: resultObjText,
+		},
+		{
+			note: "json response, proper header",
+			rule: fmt.Sprintf(`p = x { http.send({"method": "get", "url": "%s/json"}, resp); x := clean_headers(resp) }`, ts.URL),
+			expected: ok(
+				body(map[string]interface{}{"foo": "bar"}),
+				rawBody(`{"foo":"bar"}`),
+				headers("content-length", "13", "content-type", "application/json"),
+			),
+		},
+		{
+			note: "yaml response, proper header",
+			rule: fmt.Sprintf(`p = x { http.send({"method": "get", "url": "%s/yaml"}, resp); x := clean_headers(resp) }`, ts.URL),
+			expected: ok(
+				body(map[string]interface{}{"foo": "bar"}),
+				rawBody(`foo: bar`),
+				headers("content-length", "8", "content-type", "application/yaml"),
+			),
+		},
+		{
+			note: "yaml response, x-yaml header",
+			rule: fmt.Sprintf(`p = x { http.send({"method": "get", "url": "%s/x-yaml"}, resp); x := clean_headers(resp) }`, ts.URL),
+			expected: ok(
+				body(map[string]interface{}{"foo": "bar"}),
+				rawBody(`foo: bar`),
+				headers("content-length", "8", "content-type", "application/x-yaml"),
+			),
+		},
+		{
+			note: "json response, no header",
+			rule: fmt.Sprintf(`p = x { http.send({"method": "get", "url": "%s/json-no-header", "force_json_decode": true}, resp); x := clean_headers(resp) }`, ts.URL),
+			expected: ok(
+				body(map[string]interface{}{"foo": "bar"}),
+				rawBody(`{"foo":"bar"}`),
+				headers("content-length", "13", "content-type", "text/plain; charset=utf-8"),
+			),
+		},
+		{
+			note: "yaml response, no header",
+			rule: fmt.Sprintf(`p = x { http.send({"method": "get", "url": "%s/yaml-no-header", "force_yaml_decode": true}, resp); x := clean_headers(resp) }`, ts.URL),
+			expected: ok(
+				body(map[string]interface{}{"foo": "bar"}),
+				rawBody(`foo: bar`),
+				headers("content-length", "8", "content-type", "text/plain; charset=utf-8"),
+			),
+		},
+		{
+			note: "json response, no header, yaml decode",
+			rule: fmt.Sprintf(`p = x { http.send({"method": "get", "url": "%s/json-no-header", "force_yaml_decode": true}, resp); x := clean_headers(resp) }`, ts.URL),
+			expected: ok(
+				body(map[string]interface{}{"foo": "bar"}),
+				rawBody(`{"foo":"bar"}`),
+				headers("content-length", "13", "content-type", "text/plain; charset=utf-8"),
+			),
+		},
 	}
 
-	data := loadSmallTestData()
-
 	for _, tc := range tests {
-		runTopDownTestCase(t, data, tc.note, append(tc.rules, httpSendHelperRules...), tc.expected)
+		runTopDownTestCase(t, map[string]interface{}{}, tc.note, append([]string{tc.rule}, httpSendHelperRules...), tc.expected.String())
 	}
 }
 
@@ -331,7 +426,6 @@ func TestHTTPPostRequest(t *testing.T) {
 		respHeaders string
 		expected    interface{}
 	}{
-
 		{
 			note: "basic",
 			params: `{
@@ -459,10 +553,7 @@ func TestHTTPDeleteRequest(t *testing.T) {
 		"content-type":   []interface{}{"application/json"},
 	}
 
-	resultObj, err := ast.InterfaceToValue(expectedResult)
-	if err != nil {
-		panic(err)
-	}
+	resultObj := ast.MustInterfaceToValue(expectedResult)
 
 	// delete a new person
 	personToDelete := Person{ID: "2", Firstname: "Joe"}
@@ -619,10 +710,7 @@ func TestHTTPRedirectDisable(t *testing.T) {
 		"location":       []interface{}{"/test"},
 	}
 
-	resultObj, err := ast.InterfaceToValue(expectedResult)
-	if err != nil {
-		panic(err)
-	}
+	resultObj := ast.MustInterfaceToValue(expectedResult)
 
 	data := loadSmallTestData()
 	rules := append(
@@ -652,10 +740,7 @@ func TestHTTPRedirectEnable(t *testing.T) {
 		"content-length": []interface{}{"0"},
 	}
 
-	resultObj, err := ast.InterfaceToValue(expectedResult)
-	if err != nil {
-		panic(err)
-	}
+	resultObj := ast.MustInterfaceToValue(expectedResult)
 
 	data := loadSmallTestData()
 	rules := append(
@@ -677,28 +762,19 @@ func TestHTTPSendRaiseError(t *testing.T) {
 	networkErrObj["code"] = HTTPSendNetworkErr
 	networkErrObj["message"] = "Get \"foo://foo.com\": unsupported protocol scheme \"foo\""
 
-	networkErr, err := ast.InterfaceToValue(networkErrObj)
-	if err != nil {
-		panic(err)
-	}
+	networkErr := ast.MustInterfaceToValue(networkErrObj)
 
 	internalErrObj := make(map[string]interface{})
 	internalErrObj["code"] = HTTPSendInternalErr
 	internalErrObj["message"] = fmt.Sprintf(`http.send({"method": "get", "url": "%s", "force_json_decode": true, "raise_error": false, "force_cache": true}): eval_builtin_error: http.send: 'force_cache' set but 'force_cache_duration_seconds' parameter is missing`, baseURL)
 
-	internalErr, err := ast.InterfaceToValue(internalErrObj)
-	if err != nil {
-		panic(err)
-	}
+	internalErr := ast.MustInterfaceToValue(internalErrObj)
 
 	responseObj := make(map[string]interface{})
 	responseObj["status_code"] = 0
 	responseObj["error"] = internalErrObj
 
-	response, err := ast.InterfaceToValue(responseObj)
-	if err != nil {
-		panic(err)
-	}
+	response := ast.MustInterfaceToValue(responseObj)
 
 	tests := []struct {
 		note         string
@@ -1016,6 +1092,24 @@ func TestHTTPSendInterQueryCaching(t *testing.T) {
 									x = r1.body
 								}`,
 			headers:          map[string][]string{"Cache-Control": {"max-age=290304000, public"}},
+			response:         `{"x": 1}`,
+			expectedReqCount: 1,
+		},
+		{
+			note: "http.send GET cache hit serialized mode explicit (max_age_response_fresh), when parsing a yaml response",
+			ruleTemplate: `p = x {
+									r1 = http.send({"method": "get", "url": "%URL%", "cache": true, "caching_mode": "serialized"})
+									r2 = http.send({"method": "get", "url": "%URL%", "cache": true, "caching_mode": "serialized"})  # cached and fresh
+									r3 = http.send({"method": "get", "url": "%URL%", "cache": true, "caching_mode": "serialized"})  # cached and fresh
+									r1 == r2
+									r2 == r3
+									x = r1.body
+								}`,
+			headers: map[string][]string{
+				"Cache-Control": {"max-age=290304000, public"},
+				"Content-Type":  {"application/yaml"},
+			},
+			// NOTE: fed into runTopDownTestCase, so it has to be JSON; but we're making use of YAML being a superset of JSON
 			response:         `{"x": 1}`,
 			expectedReqCount: 1,
 		},
@@ -2065,7 +2159,7 @@ func TestHTTPSClient(t *testing.T) {
 
 	t.Run("Negative Test: No Root Ca", func(t *testing.T) {
 
-		expectedResult := &Error{Code: BuiltinErr, Message: "x509: certificate signed by unknown authority", Location: nil}
+		expectedResult := &Error{Code: BuiltinErr, Message: fixupDarwinGo118("x509: certificate signed by unknown authority", `“my-server” certificate is not standards compliant`), Location: nil}
 		data := loadSmallTestData()
 		rule := []string{fmt.Sprintf(
 			`p = x { http.send({"method": "get", "url": "%s", "tls_client_cert_file": "%s", "tls_client_key_file": "%s"}, x) }`, s.URL, localClientCertFile, localClientKeyFile)}
@@ -2087,7 +2181,7 @@ func TestHTTPSClient(t *testing.T) {
 
 	t.Run("Negative Test: System Certs do not include local rootCA", func(t *testing.T) {
 
-		expectedResult := &Error{Code: BuiltinErr, Message: "x509: certificate signed by unknown authority", Location: nil}
+		expectedResult := &Error{Code: BuiltinErr, Message: fixupDarwinGo118("x509: certificate signed by unknown authority", `“my-server” certificate is not standards compliant`), Location: nil}
 		data := loadSmallTestData()
 		rule := []string{fmt.Sprintf(
 			`p = x { http.send({"method": "get", "url": "%s", "tls_client_cert_file": "%s", "tls_client_key_file": "%s", "tls_use_system_certs": true}, x) }`, s.URL, localClientCertFile, localClientKeyFile)}
@@ -2331,7 +2425,7 @@ func TestHTTPSNoClientCerts(t *testing.T) {
 
 	t.Run("Negative Test: System Certs do not include local rootCA", func(t *testing.T) {
 
-		expectedResult := &Error{Code: BuiltinErr, Message: "x509: certificate signed by unknown authority", Location: nil}
+		expectedResult := &Error{Code: BuiltinErr, Message: fixupDarwinGo118("x509: certificate signed by unknown authority", `“my-server” certificate is not standards compliant`), Location: nil}
 		data := loadSmallTestData()
 		rule := []string{fmt.Sprintf(
 			`p = x { http.send({"method": "get", "url": "%s", "tls_use_system_certs": true}, x) }`, s.URL)}
@@ -2483,17 +2577,44 @@ func TestHTTPSendMetrics(t *testing.T) {
 
 	defer ts.Close()
 
-	// Execute query and verify http.send latency shows up in metrics registry.
-	m := metrics.New()
-	q := NewQuery(ast.MustParseBody(fmt.Sprintf(`http.send({"method": "get", "url": %q})`, ts.URL))).WithMetrics(m)
-	_, err := q.Run(context.Background())
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Run("latency", func(t *testing.T) {
+		// Execute query and verify http.send latency shows up in metrics registry.
+		m := metrics.New()
+		q := NewQuery(ast.MustParseBody(fmt.Sprintf(`http.send({"method": "get", "url": %q})`, ts.URL))).WithMetrics(m)
+		_, err := q.Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
 
-	if m.Timer(httpSendLatencyMetricKey).Int64() == 0 {
-		t.Fatal("expected non-zero value for http.send latency metric")
-	}
+		if m.Timer(httpSendLatencyMetricKey).Int64() == 0 {
+			t.Fatal("expected non-zero value for http.send latency metric")
+		}
+	})
+
+	t.Run("cache hits", func(t *testing.T) {
+		// add an inter-query cache
+		config, _ := iCache.ParseCachingConfig(nil)
+		interQueryCache := iCache.NewInterQueryCache(config)
+
+		// Execute query twice and verify http.send inter-query cache hit metric is incremented.
+		m := metrics.New()
+		q := NewQuery(ast.MustParseBody(fmt.Sprintf(`http.send({"method": "get", "url": %q, "cache": true})`, ts.URL))).
+			WithInterQueryBuiltinCache(interQueryCache).
+			WithMetrics(m)
+		_, err := q.Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		// cache hit
+		_, err = q.Run(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+
+		if exp, act := uint64(1), m.Counter(httpSendInterQueryCacheHits).Value(); exp != act {
+			t.Fatalf("expected %d cache hits, got %d", exp, act)
+		}
+	})
 }
 
 func TestInitDefaults(t *testing.T) {
@@ -2571,10 +2692,7 @@ func TestSocketHTTPGetRequest(t *testing.T) {
 		"test-header":    []interface{}{"test-value"},
 	}
 
-	resultObj, err := ast.InterfaceToValue(expectedResult)
-	if err != nil {
-		panic(err)
-	}
+	resultObj := ast.MustInterfaceToValue(expectedResult)
 
 	// run the test
 	tests := []struct {
@@ -2592,5 +2710,144 @@ func TestSocketHTTPGetRequest(t *testing.T) {
 
 	for _, tc := range tests {
 		runTopDownTestCase(t, data, tc.note, append(tc.rules, httpSendHelperRules...), tc.expected)
+	}
+}
+
+type tracemock struct {
+	called int
+}
+
+func (m *tracemock) NewTransport(rt http.RoundTripper, _ tracing.Options) http.RoundTripper {
+	m.called++
+	return rt
+}
+func (*tracemock) NewHandler(http.Handler, string, tracing.Options) http.Handler {
+	panic("unreachable")
+}
+
+func TestDistributedTracingEnabled(t *testing.T) {
+
+	mock := tracemock{}
+	tracing.RegisterHTTPTracing(&mock)
+
+	builtinContext := BuiltinContext{
+		Context:                context.Background(),
+		DistributedTracingOpts: tracing.NewOptions(true), // any option means it's enabled
+	}
+
+	_, client, err := createHTTPRequest(builtinContext, ast.NewObject())
+	if err != nil {
+		t.Fatalf("Unexpected error creating HTTP request %v", err)
+	}
+	if client.Transport == nil {
+		t.Fatal("No Transport defined")
+	}
+
+	if exp, act := 1, mock.called; exp != act {
+		t.Errorf("calls to NewTransported: expected %d, got %d", exp, act)
+	}
+}
+
+func TestDistributedTracingDisabled(t *testing.T) {
+
+	mock := tracemock{}
+	tracing.RegisterHTTPTracing(&mock)
+
+	builtinContext := BuiltinContext{
+		Context: context.Background(),
+	}
+
+	_, client, err := createHTTPRequest(builtinContext, ast.NewObject())
+	if err != nil {
+		t.Fatalf("Unexpected error creating HTTP request %v", err)
+	}
+	if client.Transport == nil {
+		t.Fatal("No Transport defined")
+	}
+
+	if exp, act := 0, mock.called; exp != act {
+		t.Errorf("calls to NewTransported: expected %d, got %d", exp, act)
+	}
+}
+
+func TestHTTPGetRequestAllowNet(t *testing.T) {
+
+	// test data
+	body := map[string]bool{"ok": true}
+
+	// test server
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_ = json.NewEncoder(w).Encode(body)
+	}))
+
+	defer ts.Close()
+
+	// host
+	serverURL, err := url.Parse(ts.URL)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serverHost := strings.Split(serverURL.Host, ":")[0]
+
+	// expected result
+	expectedResult := make(map[string]interface{})
+	expectedResult["status"] = "200 OK"
+	expectedResult["status_code"] = http.StatusOK
+
+	expectedResult["body"] = body
+	expectedResult["raw_body"] = "{\"ok\":true}\n"
+
+	resultObj := ast.MustInterfaceToValue(expectedResult)
+
+	expectedError := &Error{Code: "eval_builtin_error", Message: fmt.Sprintf("http.send: unallowed host: %s", serverHost)}
+
+	rules := []string{fmt.Sprintf(
+		`p = x { http.send({"method": "get", "url": "%s", "force_json_decode": true}, resp); x := remove_headers(resp) }`, ts.URL)}
+
+	// run the test
+	tests := []struct {
+		note     string
+		rules    []string
+		options  func(*Query) *Query
+		expected interface{}
+	}{
+		{
+			"http.send allow_net nil",
+			rules,
+
+			setAllowNet(nil),
+			resultObj.String(),
+		},
+		{
+			"http.send allow_net match",
+			rules,
+			setAllowNet([]string{serverHost}),
+			resultObj.String(),
+		},
+		{
+			"http.send allow_net match + additional host",
+			rules,
+			setAllowNet([]string{serverHost, "example.com"}),
+			resultObj.String(),
+		},
+		{
+			"http.send allow_net empty",
+			rules,
+			setAllowNet([]string{}),
+			expectedError,
+		},
+		{
+			"http.send allow_net no match",
+			rules,
+			setAllowNet([]string{"example.com"}),
+			expectedError,
+		},
+	}
+
+	data := loadSmallTestData()
+
+	for _, tc := range tests {
+		runTopDownTestCase(t, data, tc.note, append(tc.rules, httpSendHelperRules...), tc.expected, tc.options)
 	}
 }

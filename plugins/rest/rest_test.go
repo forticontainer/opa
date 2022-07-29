@@ -34,15 +34,41 @@ import (
 	"github.com/open-policy-agent/opa/internal/jwx/jwa"
 	"github.com/open-policy-agent/opa/internal/jwx/jws"
 	"github.com/open-policy-agent/opa/keys"
+	"github.com/open-policy-agent/opa/logging"
 
 	"github.com/open-policy-agent/opa/internal/version"
 	"github.com/open-policy-agent/opa/util/test"
+
+	testlogger "github.com/open-policy-agent/opa/logging/test"
 )
 
 const keyID = "key1"
 
-func TestNew(t *testing.T) {
+func TestAuthPluginWithNoAuthPluginLookup(t *testing.T) {
+	authPlugin := "anything"
+	cfg := Config{
+		Credentials: struct {
+			Bearer               *bearerAuthPlugin                  `json:"bearer,omitempty"`
+			OAuth2               *oauth2ClientCredentialsAuthPlugin `json:"oauth2,omitempty"`
+			ClientTLS            *clientTLSAuthPlugin               `json:"client_tls,omitempty"`
+			S3Signing            *awsSigningAuthPlugin              `json:"s3_signing,omitempty"`
+			GCPMetadata          *gcpMetadataAuthPlugin             `json:"gcp_metadata,omitempty"`
+			AzureManagedIdentity *azureManagedIdentitiesAuthPlugin  `json:"azure_managed_identity,omitempty"`
+			Plugin               *string                            `json:"plugin,omitempty"`
+		}{
+			Plugin: &authPlugin,
+		},
+	}
+	_, err := cfg.authPlugin(nil)
+	if err == nil {
+		t.Error("Expected error but got nil")
+	}
+	if want, have := "missing auth plugin lookup function", err.Error(); want != have {
+		t.Errorf("Unexpected error, want %q, have %q", want, have)
+	}
+}
 
+func TestNew(t *testing.T) {
 	tests := []struct {
 		name    string
 		input   string
@@ -193,7 +219,7 @@ func TestNew(t *testing.T) {
 			wantErr: true,
 		},
 		{
-			name: "TooManyS3CredOptions",
+			name: "MultipleS3CredOptions/metadata+environment",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -207,10 +233,34 @@ func TestNew(t *testing.T) {
 					}
 				}
 			}`,
-			wantErr: true,
+			wantErr: false,
 		},
 		{
-			name: "TooManyCredentialsOptions",
+			name: "MultipleS3CredOptions/metadata+profile+environment+webidentity",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"s3_signing": {
+						"profile_credentials": {},
+						"environment_credentials": {},
+						"web_identity_credentials": {},
+						"metadata_credentials": {
+							"aws_region": "us-east-1",
+							"iam_role": "my_iam_role"
+						}
+					}
+				}
+			}`,
+			env: map[string]string{
+				awsRoleArnEnvVar:              "TEST",
+				awsWebIdentityTokenFileEnvVar: "TEST",
+				awsRegionEnvVar:               "us-west-2",
+			},
+			wantErr: false,
+		},
+		{
+			name: "MultipleCredentialsOptions",
 			input: `{
 				"name": "foo",
 				"url": "http://localhost",
@@ -221,7 +271,7 @@ func TestNew(t *testing.T) {
 					"bearer": {
 						"scheme": "Acmecorp-Token",
 						"token": "secret"
-					}					
+					}
 				}
 			}`,
 			wantErr: true,
@@ -502,6 +552,7 @@ func TestNew(t *testing.T) {
 					},
 				}
 			}`,
+			wantErr: true,
 		},
 		{
 			name: "S3WebIdentityCreds",
@@ -517,6 +568,7 @@ func TestNew(t *testing.T) {
 			env: map[string]string{
 				awsRoleArnEnvVar:              "TEST",
 				awsWebIdentityTokenFileEnvVar: "TEST",
+				awsRegionEnvVar:               "us-west-1",
 			},
 		},
 		{
@@ -605,6 +657,17 @@ func TestNew(t *testing.T) {
         }
 			}`,
 		},
+		{
+			name: "Unknown plugin",
+			input: `{
+				"name": "foo",
+				"url": "http://localhost",
+				"credentials": {
+					"plugin": "unknown_plugin"
+        }
+			}`,
+			wantErr: true,
+		},
 	}
 
 	var results []Client
@@ -639,11 +702,11 @@ func TestNew(t *testing.T) {
 				_ = os.Setenv(key, val)
 			}
 
-			defer func() {
+			t.Cleanup(func() {
 				for key := range tc.env {
 					_ = os.Unsetenv(key)
 				}
-			}()
+			})
 
 			client, err := New([]byte(tc.input), ks, AuthPluginLookup(mockAuthPluginLookup))
 			if err != nil {
@@ -1146,6 +1209,20 @@ func TestOauth2ClientCredentials(t *testing.T) {
 				c.Credentials.OAuth2.Scopes = []string{"read", "opa"}
 			},
 		},
+		{
+			ts:  &testServer{t: t},
+			ots: &oauth2TestServer{t: t, expHeaders: map[string]string{"x-custom-header": "custom-value"}},
+			options: func(c *Config) {
+				c.Credentials.OAuth2.AdditionalHeaders = map[string]string{"x-custom-header": "custom-value"}
+			},
+		},
+		{
+			ts:  &testServer{t: t},
+			ots: &oauth2TestServer{t: t, expBody: map[string]string{"custom_field": "custom-value"}},
+			options: func(c *Config) {
+				c.Credentials.OAuth2.AdditionalParameters = map[string]string{"custom_field": "custom-value"}
+			},
+		},
 	}
 
 	for _, tc := range tests {
@@ -1448,6 +1525,187 @@ func TestS3SigningInstantiationInitializesLogger(t *testing.T) {
 	}
 }
 
+func TestS3SigningMultiCredentialProvider(t *testing.T) {
+	credentialProviderCount := 4
+	config := `{
+		"name": "foo",
+		"url": "https://bundles.example.com",
+		"credentials": {
+			"s3_signing": {
+				"environment_credentials": {},
+				"profile_credentials": {},
+				"metadata_credentials": {},
+				"web_identity_credentials": {}
+			}
+		}
+	}`
+
+	client, err := New([]byte(config), map[string]*keys.Config{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	awsPlugin := client.config.Credentials.S3Signing
+	if awsPlugin == nil {
+		t.Fatalf("Client config S3 signing credentials setup unexpected")
+	}
+
+	awsCredentialServiceChain, ok := awsPlugin.awsCredentialService().(*awsCredentialServiceChain)
+	if !ok {
+		t.Fatalf("Unexpected AWS credential service:%v is not a chain",
+			reflect.TypeOf(awsCredentialServiceChain))
+	}
+
+	if len(awsCredentialServiceChain.awsCredentialServices) != credentialProviderCount {
+		t.Fatalf("Credential provider count mismatch %d != %d", credentialProviderCount,
+			len(awsCredentialServiceChain.awsCredentialServices))
+	}
+
+	expectedOrder := []awsCredentialService{
+		&awsEnvironmentCredentialService{},
+		&awsWebIdentityCredentialService{},
+		&awsProfileCredentialService{},
+		&awsMetadataCredentialService{},
+	}
+
+	if !reflect.DeepEqual(awsCredentialServiceChain.awsCredentialServices,
+		expectedOrder) {
+		t.Fatalf("Ordering is unexpected")
+	}
+}
+
+func TestAWSCredentialServiceChain(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr bool
+		env     map[string]string
+	}{
+		{
+			name: "Fallback to Environment Credential",
+			input: `{
+				"name": "foo",
+				"url": "https://bundles.example.com",
+				"credentials": {
+					"s3_signing": {
+						"web_identity_credentials": {},
+						"environment_credentials": {},
+						"profile_credentials": {},
+						"metadata_credentials": {}
+					}
+				}
+			}`,
+			wantErr: false,
+			env: map[string]string{
+				accessKeyEnvVar: "a",
+				secretKeyEnvVar: "a",
+				awsRegionEnvVar: "us-east-1",
+			},
+		},
+		{
+			name: "No provider is successful",
+			input: `{
+				"name": "foo",
+				"url": "https://bundles.example.com",
+				"credentials": {
+					"s3_signing": {
+						"web_identity_credentials": {},
+						"environment_credentials": {},
+						"profile_credentials": {},
+						"metadata_credentials": {}
+					}
+				}
+			}`,
+			wantErr: true,
+			env:     map[string]string{},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			for key, val := range tc.env {
+				_ = os.Setenv(key, val)
+			}
+
+			t.Cleanup(func() {
+				for key := range tc.env {
+					_ = os.Unsetenv(key)
+				}
+			})
+
+			client, err := New([]byte(tc.input), map[string]*keys.Config{})
+			if err != nil {
+				t.Fatalf("Unexpected error: %v", err)
+			}
+
+			awsPlugin := client.config.Credentials.S3Signing
+			if awsPlugin == nil {
+				t.Fatalf("Client config S3 signing credentials setup unexpected")
+			}
+
+			req, err := http.NewRequest("GET", "/example/bundle.tar.gz", nil)
+			if err != nil {
+				t.Fatalf("Failed to create HTTP request: %v", err)
+			}
+
+			awsPlugin.logger = client.logger
+			err = awsPlugin.Prepare(req)
+			if err != nil && !tc.wantErr {
+				t.Fatalf("Unexpected error: %v", err)
+			} else if err == nil && tc.wantErr {
+				t.Fatalf("Expected error for input %v", tc.input)
+			}
+		})
+	}
+}
+
+func TestDebugLoggingRequestMaskAuthorizationHeader(t *testing.T) {
+	token := "secret"
+	ts := testServer{t: t, expBearerToken: token}
+	ts.start()
+	defer ts.stop()
+
+	config := fmt.Sprintf(`{
+		"name": "foo",
+		"url": %q,
+		"credentials": {
+			"bearer": {
+				"token": %q
+			}
+		}
+	}`, ts.server.URL, token)
+	client, err := New([]byte(config), map[string]*keys.Config{})
+	if err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	logger := testlogger.New()
+	logger.SetLevel(logging.Debug)
+	client.logger = logger
+
+	ctx := context.Background()
+	if _, err := client.Do(ctx, "GET", "test"); err != nil {
+		t.Fatalf("Unexpected error: %v", err)
+	}
+
+	var reqLogFound bool
+	for _, entry := range logger.Entries() {
+		if entry.Fields["headers"] != nil {
+			headers := entry.Fields["headers"].(http.Header)
+			authzHeader := headers.Get("Authorization")
+			if authzHeader != "" {
+				reqLogFound = true
+				if authzHeader != "REDACTED" {
+					t.Errorf("Excpected redacted Authorization header value, got %v", authzHeader)
+				}
+			}
+		}
+	}
+	if !reqLogFound {
+		t.Fatalf("Expected log entry from request")
+	}
+}
+
 func newTestClient(t *testing.T, ts *testServer, certPath string, keypath string) *Client {
 	config := fmt.Sprintf(`{
 			"name": "foo",
@@ -1500,6 +1758,8 @@ type oauth2TestServer struct {
 	expGrantType     string
 	expClientID      string
 	expClientSecret  string
+	expHeaders       map[string]string
+	expBody          map[string]string
 	expJwtCredential bool
 	expScope         *[]string
 	expAlgorithm     jwa.SignatureAlgorithm
@@ -1653,6 +1913,18 @@ func (t *oauth2TestServer) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Form["grant_type"][0] != t.expGrantType {
 		t.t.Fatalf("Expected grant_type=%v", t.expGrantType)
+	}
+
+	for k, v := range t.expBody {
+		if r.Form[k][0] != v {
+			t.t.Fatalf("Expected header %s=%s got %s", k, v, r.Form[k][0])
+		}
+	}
+
+	for k, v := range t.expHeaders {
+		if r.Header.Get(k) != v {
+			t.t.Fatalf("Expected header %s=%s got %s", k, v, r.Header.Get(k))
+		}
 	}
 
 	if len(r.Form["scope"]) > 0 {

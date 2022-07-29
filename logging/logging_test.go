@@ -1,11 +1,13 @@
 package logging
 
 import (
+	"bytes"
+	"strings"
 	"testing"
 )
 
 func TestWithFields(t *testing.T) {
-	logger := NewStandardLogger().WithFields(map[string]interface{}{"context": "contextvalue"})
+	logger := New().WithFields(map[string]interface{}{"context": "contextvalue"})
 
 	var fieldvalue interface{}
 	var ok bool
@@ -19,8 +21,28 @@ func TestWithFields(t *testing.T) {
 	}
 }
 
+func TestCaptureWarningWithErrorSet(t *testing.T) {
+	buf := bytes.Buffer{}
+	logger := New()
+	logger.SetOutput(&buf)
+	logger.SetLevel(Error)
+
+	logger.Warn("This is a warning. Next time, I won't compile.")
+	logger.Error("Fix your issues. I'm not compiling.")
+
+	expected := []string{
+		`level=warning msg="This is a warning. Next time, I won't compile."`,
+		`level=error msg="Fix your issues. I'm not compiling."`,
+	}
+	for _, exp := range expected {
+		if !strings.Contains(buf.String(), exp) {
+			t.Errorf("expected string %q not found in logs", exp)
+		}
+	}
+}
+
 func TestWithFieldsOverrides(t *testing.T) {
-	logger := NewStandardLogger().
+	logger := New().
 		WithFields(map[string]interface{}{"context": "contextvalue"}).
 		WithFields(map[string]interface{}{"context": "changedcontextvalue"})
 
@@ -37,7 +59,7 @@ func TestWithFieldsOverrides(t *testing.T) {
 }
 
 func TestWithFieldsMerges(t *testing.T) {
-	logger := NewStandardLogger().
+	logger := New().
 		WithFields(map[string]interface{}{"context": "contextvalue"}).
 		WithFields(map[string]interface{}{"anothercontext": "anothercontextvalue"})
 

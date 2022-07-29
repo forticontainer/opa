@@ -6,6 +6,7 @@
 package rego
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -17,6 +18,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -214,6 +216,22 @@ func TestRegoRewrittenVarsCapture(t *testing.T) {
 		t.Fatal("Expected a to be 1 but got:", rs[0].Bindings["a"])
 	}
 
+}
+
+func TestRegoDoNotCaptureVoidCalls(t *testing.T) {
+
+	ctx := context.Background()
+
+	r := New(Query("print(1)"))
+
+	rs, err := r.Eval(ctx)
+	if err != nil || len(rs) != 1 {
+		t.Fatal(err, "rs:", rs)
+	}
+
+	if !rs[0].Expressions[0].Value.(bool) {
+		t.Fatal("expected expression value to be true")
+	}
 }
 
 func TestRegoCancellation(t *testing.T) {
@@ -641,6 +659,61 @@ func TestPartialRewriteEquals(t *testing.T) {
 	}
 }
 
+// NOTE(sr): https://github.com/open-policy-agent/opa/issues/4345
+func TestPrepareAndEvalRaceConditions(t *testing.T) {
+	tests := []struct {
+		note   string
+		module string
+		exp    string
+	}{
+		{
+			note: "object",
+			module: `package test
+			p[{"x":"y"}]`,
+			exp: `[[[{"x":"y"}]]]`,
+		},
+		{
+			note: "set",
+			module: `package test
+			p[{"x"}]`,
+			exp: `[[[["x"]]]]`,
+		},
+		{
+			note: "array",
+			module: `package test
+			p[["x"]]`,
+			exp: `[[[["x"]]]]`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			r := New(
+				Query("data.test.p"),
+				Module("", tc.module),
+				Package("foo"),
+			)
+
+			pq, err := r.PrepareForEval(context.Background())
+			if err != nil {
+				t.Fatalf("Unexpected error: %s", err.Error())
+			}
+
+			// run this 1000 times concurrently
+			var wg sync.WaitGroup
+			wg.Add(1000)
+			for i := 0; i < 1000; i++ {
+				go func(t *testing.T) {
+					t.Helper()
+					assertPreparedEvalQueryEval(t, pq, []EvalOption{}, tc.exp)
+					wg.Done()
+				}(t)
+			}
+			wg.Wait()
+		})
+	}
+}
+
 func TestPrepareAndEvalNewInput(t *testing.T) {
 	module := `
 	package test
@@ -861,6 +934,48 @@ func TestPrepareAndEvalOriginal(t *testing.T) {
 	// as expected for Eval.
 
 	assertEval(t, r, "[[2]]")
+}
+
+func TestPrepareAndEvalNewPrintHook(t *testing.T) {
+	module := `
+	package test
+	x { print(input) }
+	`
+
+	r := New(
+		Query("data.test.x"),
+		Module("", module),
+		Package("foo"),
+		EnablePrintStatements(true),
+	)
+
+	pq, err := r.PrepareForEval(context.Background())
+	if err != nil {
+		t.Fatalf("Unexpected error: %s", err.Error())
+	}
+
+	var buf0 bytes.Buffer
+	ph0 := topdown.NewPrintHook(&buf0)
+	assertPreparedEvalQueryEval(t, pq, []EvalOption{
+		EvalInput("hello"),
+		EvalPrintHook(ph0),
+	}, "[[true]]")
+
+	if exp, act := "hello\n", buf0.String(); exp != act {
+		t.Fatalf("print hook, expected %q, got %q", exp, act)
+	}
+
+	// repeat
+	var buf1 bytes.Buffer
+	ph1 := topdown.NewPrintHook(&buf1)
+	assertPreparedEvalQueryEval(t, pq, []EvalOption{
+		EvalInput("world"),
+		EvalPrintHook(ph1),
+	}, "[[true]]")
+
+	if exp, act := "world\n", buf1.String(); exp != act {
+		t.Fatalf("print hook, expected %q, got %q", exp, act)
+	}
 }
 
 func TestPrepareAndPartialResult(t *testing.T) {

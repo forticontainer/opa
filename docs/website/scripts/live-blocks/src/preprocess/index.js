@@ -79,7 +79,10 @@ async function processFile(path) {
 function getVersion(path) {
   const versionMatch = (new RegExp(`/(v[^/]*|${VERSION_EDGE}|${VERSION_LATEST})/`)).exec(filepath.resolve(path))
   if (!versionMatch) {
-    return VERSION_LATEST
+    if (process.env.LATEST) {
+      return VERSION_LATEST
+    }
+    return VERSION_EDGE
   }
 
   return versionMatch[1]
@@ -103,7 +106,12 @@ function constructGroups($, codeElts) {
   codeElts.each(function () { // Cheerio's `each` method (codeElts is not iterable).
     try {
       const codeElt = $(this)
-      const container = codeElt.parent().parent()
+      // remove trailing newline
+      codeElt.text(codeElt.text().trim())
+
+      // wrap in div
+      const container = $('<div></div>').addClass(CLASSES.BLOCK_CONTAINER)
+      codeElt.parent().wrap(container)
 
       const label = codeElt.data('lang')
       let info = infoFromLabel(label)
@@ -154,10 +162,6 @@ function constructGroups($, codeElts) {
 function styleBlocks(groups) {
   for (let group of Object.values(groups)) {
     for (let [type, block] of Object.entries(group)) {
-      // Add container class, remove hugo highlight class
-      block.container.addClass(CLASSES.BLOCK_CONTAINER)
-      block.container.removeClass(CLASSES.HUGO_BLOCK_CONTAINER)
-
       // Reset highlighting
       const content = block.get()
       block.codeElt.empty()

@@ -120,19 +120,19 @@ package system
 **Correct**:
 
 ```live:patch/good:module:read_only,openable
-main = {
-	"apiVersion": "admission.k8s.io/v1beta1",
+main := {
+	"apiVersion": "admission.k8s.io/v1",
 	"kind": "AdmissionReview",
 	"response": response,
 }
 
-response = {
+response := {
   "allowed": true,
   "patchType": "JSONPatch",
   "patch": base64.encode(json.marshal(patches))   # <-- GOOD: uses base64.encode
 }
 
-patches = [
+patches := [
   {
     "op": "add",
     "path": "/metadata/annotations/acmecorp.com~1myannotation",
@@ -144,19 +144,19 @@ patches = [
 **Incorrect**:
 
 ```live:patch/bad:module:read_only
-main = {
-	"apiVersion": "admission.k8s.io/v1beta1",
+main := {
+	"apiVersion": "admission.k8s.io/v1",
 	"kind": "AdmissionReview",
 	"response": response,
 }
 
-response = {
+response := {
   "allowed": true,
   "patchType": "JSONPatch",
   "patch": base64url.encode(json.marshal(patches))   # <-- BAD: uses base64url.encode
 }
 
-patches = [
+patches := [
   {
     "op": "add",
     "path": "/metadata/annotations/acmecorp.com~1myannotation",

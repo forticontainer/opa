@@ -14,18 +14,22 @@ WASM_ENABLED ?= 1
 GO := CGO_ENABLED=$(CGO_ENABLED) GOFLAGS="-buildmode=exe" go
 GO_TEST_TIMEOUT := -timeout 30m
 
+GOVERSION ?= $(shell cat ./.go-version)
+GOARCH := $(shell go env GOARCH)
+GOOS := $(shell go env GOOS)
+
+ifeq ($(GOOS)/$(GOARCH),darwin/arm64)
+WASM_ENABLED=0
+endif
+
 GO_TAGS := -tags=
 ifeq ($(WASM_ENABLED),1)
 GO_TAGS = -tags=opa_wasm
 endif
 
-GOVERSION ?= $(shell cat ./.go-version)
-GOARCH := $(shell go env GOARCH)
-GOOS := $(shell go env GOOS)
+GOLANGCI_LINT_VERSION := v1.46.2
 
-GOLANGCI_LINT_VERSION := v1.40.1
-
-DOCKER_RUNNING := $(shell docker ps >/dev/null 2>&1 && echo 1 || echo 0)
+DOCKER_RUNNING ?= $(shell docker ps >/dev/null 2>&1 && echo 1 || echo 0)
 
 # We use root because the windows build, invoked through the ci-go-build-windows
 # target, installs the gcc mingw32 cross-compiler.
@@ -41,12 +45,19 @@ endif
 
 DOCKER := docker
 
+# BuildKit is required for automatic platform arg injection (see Dockerfile)
+export DOCKER_BUILDKIT := 1
+
+# Supported platforms to include in image manifest lists
+DOCKER_PLATFORMS := linux/amd64
+DOCKER_PLATFORMS_STATIC := linux/amd64,linux/arm64
+
 BIN := opa_$(GOOS)_$(GOARCH)
 
 # Optional external configuration useful for forks of OPA
 DOCKER_IMAGE ?= openpolicyagent/opa
 S3_RELEASE_BUCKET ?= opa-releases
-FUZZ_TIME ?= 3600  # 1hr
+FUZZ_TIME ?= 1h
 TELEMETRY_URL ?= #Default empty
 
 BUILD_COMMIT := $(shell ./build/get-build-commit.sh)
@@ -81,6 +92,10 @@ all: build test perf wasm-sdk-e2e-test check
 .PHONY: version
 version:
 	@echo $(VERSION)
+
+.PHONY: release-dir
+release-dir:
+	@echo $(RELEASE_DIR)
 
 .PHONY: generate
 generate: wasm-lib-build
@@ -151,7 +166,7 @@ clean: wasm-lib-clean
 
 .PHONY: fuzz
 fuzz:
-	$(MAKE) -C ./build/fuzzer all
+	go test ./ast -fuzz FuzzParseStatementsAndCompileModules -fuzztime ${FUZZ_TIME} -v -run '^$$'
 
 ######################################################
 #
@@ -234,6 +249,7 @@ CI_GOLANG_DOCKER_MAKE := $(DOCKER) run \
 	-v $(PWD):/src \
 	-w /src \
 	-e GOCACHE=/src/.go/cache \
+	-e GOARCH=$(GOARCH) \
 	-e CGO_ENABLED=$(CGO_ENABLED) \
 	-e WASM_ENABLED=$(WASM_ENABLED) \
 	-e FUZZ_TIME=$(FUZZ_TIME) \
@@ -257,22 +273,32 @@ ci-check-working-copy: generate
 ci-wasm: wasm-test
 
 .PHONY: ci-build-linux
-ci-build-linux: ensure-release-dir
+ci-build-linux: ensure-release-dir ensure-linux-toolchain
 	@$(MAKE) build GOOS=linux
 	chmod +x opa_linux_$(GOARCH)
 	mv opa_linux_$(GOARCH) $(RELEASE_DIR)/
+	cd $(RELEASE_DIR)/ && shasum -a 256 opa_linux_$(GOARCH) > opa_linux_$(GOARCH).sha256
 
 .PHONY: ci-build-linux-static
 ci-build-linux-static: ensure-release-dir
 	@$(MAKE) build GOOS=linux WASM_ENABLED=0 CGO_ENABLED=0
 	chmod +x opa_linux_$(GOARCH)
 	mv opa_linux_$(GOARCH) $(RELEASE_DIR)/opa_linux_$(GOARCH)_static
+	cd $(RELEASE_DIR)/ && shasum -a 256 opa_linux_$(GOARCH)_static > opa_linux_$(GOARCH)_static.sha256
 
 .PHONY: ci-build-darwin
 ci-build-darwin: ensure-release-dir
 	@$(MAKE) build GOOS=darwin
 	chmod +x opa_darwin_$(GOARCH)
 	mv opa_darwin_$(GOARCH) $(RELEASE_DIR)/
+	cd $(RELEASE_DIR)/ && shasum -a 256 opa_darwin_$(GOARCH) > opa_darwin_$(GOARCH).sha256
+
+.PHONY: ci-build-darwin-arm64-static
+ci-build-darwin-arm64-static: ensure-release-dir
+	@$(MAKE) build GOOS=darwin GOARCH=arm64 WASM_ENABLED=0 CGO_ENABLED=0
+	chmod +x opa_darwin_arm64
+	mv opa_darwin_arm64 $(RELEASE_DIR)/opa_darwin_arm64_static
+	cd $(RELEASE_DIR)/ && shasum -a 256 opa_darwin_arm64_static > opa_darwin_arm64_static.sha256
 
 # NOTE: This target expects to be run as root on some debian/ubuntu variant
 # that can install the `gcc-mingw-w64-x86-64` package via apt-get.
@@ -281,92 +307,120 @@ ci-build-windows: ensure-release-dir
 	build/ensure-windows-toolchain.sh
 	@$(MAKE) build GOOS=windows CC=x86_64-w64-mingw32-gcc
 	mv opa_windows_$(GOARCH) $(RELEASE_DIR)/opa_windows_$(GOARCH).exe
+	cd $(RELEASE_DIR)/ && shasum -a 256 opa_windows_$(GOARCH).exe > opa_windows_$(GOARCH).exe.sha256
 
 .PHONY: ensure-release-dir
 ensure-release-dir:
 	mkdir -p $(RELEASE_DIR)
 
+.PHONY: ensure-executable-bin
+ensure-executable-bin:
+	find $(RELEASE_DIR) -type f ! -name "*.sha256" | xargs chmod +x
+
+.PHONY: ensure-linux-toolchain
+ensure-linux-toolchain:
+ifeq ($(CGO_ENABLED),1)
+	$(eval export CC = $(shell GOARCH=$(GOARCH) build/ensure-linux-toolchain.sh))
+else
+	@echo "CGO_ENABLED=$(CGO_ENABLED). No need to check gcc toolchain."
+endif
+
 .PHONY: build-all-platforms
-build-all-platforms: ci-build-linux ci-build-linux-static ci-build-darwin ci-build-windows
+build-all-platforms: ci-build-linux ci-build-linux-static ci-build-darwin ci-build-darwin-arm64-static ci-build-windows
 
 .PHONY: image-quick
-image-quick:
-	chmod +x $(RELEASE_DIR)/opa_linux_amd64*
+image-quick: image-quick-$(GOARCH)
+
+# % = arch
+.PHONY: image-quick-%
+image-quick-%: ensure-executable-bin
+ifneq ($(GOARCH),arm64) # build only static images for arm64
 	$(DOCKER) build \
 		-t $(DOCKER_IMAGE):$(VERSION) \
 		--build-arg BASE=gcr.io/distroless/cc \
-		--build-arg BIN=$(RELEASE_DIR)/opa_linux_amd64 \
+		--build-arg BIN_DIR=$(RELEASE_DIR) \
+		--platform linux/$* \
 		.
 	$(DOCKER) build \
 		-t $(DOCKER_IMAGE):$(VERSION)-debug \
 		--build-arg BASE=gcr.io/distroless/cc:debug \
-		--build-arg BIN=$(RELEASE_DIR)/opa_linux_amd64 \
+		--build-arg BIN_DIR=$(RELEASE_DIR) \
+		--platform linux/$* \
 		.
 	$(DOCKER) build \
 		-t $(DOCKER_IMAGE):$(VERSION)-rootless \
-		--build-arg USER=1000 \
+		--build-arg USER=1000:1000 \
 		--build-arg BASE=gcr.io/distroless/cc \
-		--build-arg BIN=$(RELEASE_DIR)/opa_linux_amd64 \
+		--build-arg BIN_DIR=$(RELEASE_DIR) \
+		--platform linux/$* \
 		.
+endif
 	$(DOCKER) build \
 		-t $(DOCKER_IMAGE):$(VERSION)-static \
 		--build-arg BASE=gcr.io/distroless/static \
-		--build-arg BIN=$(RELEASE_DIR)/opa_linux_amd64_static \
+		--build-arg BIN_DIR=$(RELEASE_DIR) \
+		--build-arg BIN_SUFFIX=_static \
+		--platform linux/$* \
+		.
+
+# % = base tag
+.PHONY: push-manifest-list-%
+push-manifest-list-%: ensure-executable-bin
+	$(DOCKER) buildx build \
+		--tag $(DOCKER_IMAGE):$* \
+		--build-arg BASE=gcr.io/distroless/cc \
+		--build-arg BIN_DIR=$(RELEASE_DIR) \
+		--platform $(DOCKER_PLATFORMS) \
+		--push \
+		.
+	$(DOCKER) buildx build \
+		--tag $(DOCKER_IMAGE):$*-debug \
+		--build-arg BASE=gcr.io/distroless/cc:debug \
+		--build-arg BIN_DIR=$(RELEASE_DIR) \
+		--platform $(DOCKER_PLATFORMS) \
+		--push \
+		.
+	$(DOCKER) buildx build \
+		--tag $(DOCKER_IMAGE):$*-rootless \
+		--build-arg USER=1000:1000 \
+		--build-arg BASE=gcr.io/distroless/cc \
+		--build-arg BIN_DIR=$(RELEASE_DIR) \
+		--platform $(DOCKER_PLATFORMS) \
+		--push \
+		.
+	$(DOCKER) buildx build \
+		--tag $(DOCKER_IMAGE):$*-static \
+		--build-arg BASE=gcr.io/distroless/static \
+		--build-arg BIN_DIR=$(RELEASE_DIR) \
+		--build-arg BIN_SUFFIX=_static \
+		--platform $(DOCKER_PLATFORMS_STATIC) \
+		--push \
 		.
 
 .PHONY: ci-image-smoke-test
-ci-image-smoke-test: image-quick
-	$(DOCKER) run $(DOCKER_IMAGE):$(VERSION) version
-	$(DOCKER) run $(DOCKER_IMAGE):$(VERSION)-debug version
-	$(DOCKER) run $(DOCKER_IMAGE):$(VERSION)-rootless version
-	$(DOCKER) run $(DOCKER_IMAGE):$(VERSION)-static version
+ci-image-smoke-test: ci-image-smoke-test-$(GOARCH)
 
+# % = arch
+.PHONY: ci-image-smoke-test-%
+ci-image-smoke-test-%: image-quick-%
+ifneq ($(GOARCH),arm64) # we build only static images for arm64
+	$(DOCKER) run --platform linux/$* $(DOCKER_IMAGE):$(VERSION) version
+	$(DOCKER) run --platform linux/$* $(DOCKER_IMAGE):$(VERSION)-debug version
+	$(DOCKER) run --platform linux/$* $(DOCKER_IMAGE):$(VERSION)-rootless version
+
+	$(DOCKER) image inspect $(DOCKER_IMAGE):$(VERSION)-rootless | opa eval --fail --format raw --stdin-input 'input[0].Config.User = "1000:1000"'
+endif
+	$(DOCKER) run --platform linux/$* $(DOCKER_IMAGE):$(VERSION)-static version
+
+# % = rego/wasm
 .PHONY: ci-binary-smoke-test-%
 ci-binary-smoke-test-%:
 	chmod +x "$(RELEASE_DIR)/$(BINARY)"
 	"$(RELEASE_DIR)/$(BINARY)" eval -t "$*" 'time.now_ns()'
 
-.PHONY: push
-push:
-	$(DOCKER) push $(DOCKER_IMAGE):$(VERSION)
-	$(DOCKER) push $(DOCKER_IMAGE):$(VERSION)-debug
-	$(DOCKER) push $(DOCKER_IMAGE):$(VERSION)-rootless
-	$(DOCKER) push $(DOCKER_IMAGE):$(VERSION)-static
-
-.PHONY: tag-latest
-tag-latest:
-	$(DOCKER) tag $(DOCKER_IMAGE):$(VERSION) $(DOCKER_IMAGE):latest
-	$(DOCKER) tag $(DOCKER_IMAGE):$(VERSION)-debug $(DOCKER_IMAGE):latest-debug
-	$(DOCKER) tag $(DOCKER_IMAGE):$(VERSION)-rootless $(DOCKER_IMAGE):latest-rootless
-	$(DOCKER) tag $(DOCKER_IMAGE):$(VERSION)-static $(DOCKER_IMAGE):latest-static
-
-.PHONY: push-latest
-push-latest:
-	$(DOCKER) push $(DOCKER_IMAGE):latest
-	$(DOCKER) push $(DOCKER_IMAGE):latest-debug
-	$(DOCKER) push $(DOCKER_IMAGE):latest-rootless
-	$(DOCKER) push $(DOCKER_IMAGE):latest-static
-
 .PHONY: push-binary-edge
 push-binary-edge:
-	aws s3 cp $(RELEASE_DIR)/opa_darwin_$(GOARCH) s3://$(S3_RELEASE_BUCKET)/edge/opa_darwin_$(GOARCH)
-	aws s3 cp $(RELEASE_DIR)/opa_windows_$(GOARCH).exe s3://$(S3_RELEASE_BUCKET)/edge/opa_windows_$(GOARCH).exe
-	aws s3 cp $(RELEASE_DIR)/opa_linux_$(GOARCH) s3://$(S3_RELEASE_BUCKET)/edge/opa_linux_$(GOARCH)
-	aws s3 cp $(RELEASE_DIR)/opa_linux_$(GOARCH)_static s3://$(S3_RELEASE_BUCKET)/edge/opa_linux_$(GOARCH)_static
-
-.PHONY: tag-edge
-tag-edge:
-	$(DOCKER) tag $(DOCKER_IMAGE):$(VERSION) $(DOCKER_IMAGE):edge
-	$(DOCKER) tag $(DOCKER_IMAGE):$(VERSION)-debug $(DOCKER_IMAGE):edge-debug
-	$(DOCKER) tag $(DOCKER_IMAGE):$(VERSION)-rootless $(DOCKER_IMAGE):edge-rootless
-	$(DOCKER) tag $(DOCKER_IMAGE):$(VERSION)-static $(DOCKER_IMAGE):edge-static
-
-.PHONY: push-edge
-push-edge:
-	$(DOCKER) push $(DOCKER_IMAGE):edge
-	$(DOCKER) push $(DOCKER_IMAGE):edge-debug
-	$(DOCKER) push $(DOCKER_IMAGE):edge-rootless
-	$(DOCKER) push $(DOCKER_IMAGE):edge-static
+	aws s3 sync $(RELEASE_DIR) s3://$(S3_RELEASE_BUCKET)/edge/ --no-progress --region us-west-1
 
 .PHONY: docker-login
 docker-login:
@@ -374,14 +428,14 @@ docker-login:
 	@echo ${DOCKER_PASSWORD} | $(DOCKER) login -u ${DOCKER_USER} --password-stdin
 
 .PHONY: push-image
-push-image: docker-login image-quick push
+push-image: docker-login push-manifest-list-$(VERSION)
 
 .PHONY: push-wasm-builder-image
 push-wasm-builder-image: docker-login
 	$(MAKE) -C wasm push-builder
 
 .PHONY: deploy-ci
-deploy-ci: push-image tag-edge push-edge push-binary-edge
+deploy-ci: push-image push-manifest-list-edge push-binary-edge
 
 .PHONY: release-ci
 # Don't tag and push "latest" image tags if the version is a release candidate or a bugfix branch
@@ -389,18 +443,18 @@ deploy-ci: push-image tag-edge push-edge push-binary-edge
 ifneq (,$(or $(findstring rc,$(VERSION)), $(findstring release-,$(shell git branch --contains HEAD))))
 release-ci: push-image
 else
-release-ci: push-image tag-latest push-latest
+release-ci: push-image push-manifest-list-latest
 endif
 
 .PHONY: netlify-prod
-netlify-prod: clean docs-clean build docs-generate docs-production-build
+netlify-prod: clean docs-clean build docs-production-build
 
 .PHONY: netlify-preview
-netlify-preview: clean docs-clean build docs-live-blocks-install-deps docs-live-blocks-test docs-generate docs-preview-build
+netlify-preview: clean docs-clean build docs-live-blocks-install-deps docs-live-blocks-test docs-dev-generate docs-preview-build
 
+# Kept for compatibility. Use `make fuzz` instead.
 .PHONY: check-fuzz
-check-fuzz:
-	./build/check-fuzz.sh $(FUZZ_TIME)
+check-fuzz: fuzz
 
 # GOPRIVATE=* causes go to fetch all dependencies from their corresponding VCS
 # source, not through the golang-provided proxy services. We're cleaning out
@@ -425,17 +479,21 @@ check-go-module:
 
 .PHONY: release-patch
 release-patch:
+ifeq ($(GITHUB_TOKEN),)
+	@echo "\033[0;31mGITHUB_TOKEN environment variable missing.\033[33m Provide a GitHub Personal Access Token (PAT) with the 'read:org' scope.\033[0m"
+endif
 	@$(DOCKER) run $(DOCKER_FLAGS) \
+		-e GITHUB_TOKEN=$(GITHUB_TOKEN) \
 		-e LAST_VERSION=$(LAST_VERSION) \
 		-v $(PWD):/_src \
-		python:2.7 \
+		cmd.cat/make/git/go/python2/perl \
 		/_src/build/gen-release-patch.sh --version=$(VERSION) --source-url=/_src
 
 .PHONY: dev-patch
 dev-patch:
 	@$(DOCKER) run $(DOCKER_FLAGS) \
 		-v $(PWD):/_src \
-		python:2.7 \
+		cmd.cat/make/git/go/python2/perl \
 		/_src/build/gen-dev-patch.sh --version=$(VERSION) --source-url=/_src
 
 # Deprecated targets. To be removed.

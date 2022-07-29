@@ -11,6 +11,10 @@ import (
 	"reflect"
 	"testing"
 
+	"github.com/open-policy-agent/opa/bundle"
+
+	"github.com/open-policy-agent/opa/internal/file/archive"
+
 	"github.com/open-policy-agent/opa/storage/internal/errors"
 
 	"github.com/open-policy-agent/opa/storage"
@@ -87,8 +91,11 @@ func TestInMemoryWrite(t *testing.T) {
 		{"add obj (existing)", "add", "/b/v2", `"x"`, nil, "/b", `{"v1": "hello", "v2": "x"}`},
 
 		{"append arr", "add", "/a/-", `"x"`, nil, "/a", `[1,2,3,4,"x"]`},
+		{"append arr-2", "add", "/a/4", `"x"`, nil, "/a", `[1,2,3,4,"x"]`},
 		{"append obj/arr", "add", `/c/0/x/-`, `"x"`, nil, "/c/0/x", `[true,false,"foo","x"]`},
+		{"append obj/arr-2", "add", `/c/0/x/3`, `"x"`, nil, "/c/0/x", `[true,false,"foo","x"]`},
 		{"append arr/arr", "add", `/h/0/-`, `"x"`, nil, `/h/0/3`, `"x"`},
+		{"append arr/arr-2", "add", `/h/0/3`, `"x"`, nil, `/h/0/3`, `"x"`},
 		{"append err", "remove", "/c/0/x/-", "", invalidPatchError("/c/0/x/-: invalid patch path"), "", nil},
 		{"append err-2", "replace", "/c/0/x/-", "", invalidPatchError("/c/0/x/-: invalid patch path"), "", nil},
 
@@ -255,12 +262,14 @@ func TestInMemoryTxnMultipleWrites(t *testing.T) {
 		{storage.AddOp, "/a/-", "[]"},
 		{storage.AddOp, "/a/4/-", "1"},
 		{storage.AddOp, "/a/4/-", "2"},
+		{storage.AddOp, "/a/4/2", "3"},
 		{storage.AddOp, "/b/foo", "{}"},
 		{storage.AddOp, "/b/foo/bar", "{}"},
 		{storage.AddOp, "/b/foo/bar/baz", "1"},
 		{storage.AddOp, "/arr", "[]"},
 		{storage.AddOp, "/arr/-", "1"},
 		{storage.AddOp, "/arr/0", "2"},
+		{storage.AddOp, "/arr/2", "3"},
 		{storage.AddOp, "/c/0/x/-", "0"},
 		{storage.AddOp, "/_", "null"}, // introduce new txn.log head
 		{storage.AddOp, "/c/0", `"new c[0]"`},
@@ -275,9 +284,9 @@ func TestInMemoryTxnMultipleWrites(t *testing.T) {
 		path     string
 		expected string
 	}{
-		{"/a", `[1,2,3,4,[1,2]]`},
+		{"/a", `[1,2,3,4,[1,2,3]]`},
 		{"/b/foo", `{"bar": {"baz": 1}}`},
-		{"/arr", `[2,1]`},
+		{"/arr", `[2,1,3]`},
 		{"/c/0", `"new c[0]"`},
 		{"/c/1", `"new c[1]"`},
 		{"/d/f", `{"g": {"h": 0, "i": {"j": 1}}}`},
@@ -318,6 +327,224 @@ func TestInMemoryTxnMultipleWrites(t *testing.T) {
 	}
 }
 
+func TestTruncateNoExistingPath(t *testing.T) {
+	ctx := context.Background()
+	store := NewFromObject(map[string]interface{}{})
+	txn := storage.NewTransactionOrDie(ctx, store, storage.WriteParams)
+
+	var archiveFiles = map[string]string{
+		"/a/b/c/data.json": "[1,2,3]",
+	}
+
+	var files [][2]string
+	for name, content := range archiveFiles {
+		files = append(files, [2]string{name, content})
+	}
+
+	buf := archive.MustWriteTarGz(files)
+	b, err := bundle.NewReader(buf).WithLazyLoadingMode(true).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iterator := bundle.NewIterator(b.Raw)
+
+	err = store.Truncate(ctx, txn, storage.WriteParams, iterator)
+	if err != nil {
+		t.Fatalf("Unexpected truncate error: %v", err)
+	}
+
+	if err := store.Commit(ctx, txn); err != nil {
+		t.Fatalf("Unexpected commit error: %v", err)
+	}
+
+	txn = storage.NewTransactionOrDie(ctx, store)
+
+	actual, err := store.Read(ctx, txn, storage.MustParsePath("/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := `
+{
+	"a": {
+		"b": {
+			"c": [1,2,3]
+		}
+	}
+}
+`
+	jsn := util.MustUnmarshalJSON([]byte(expected))
+
+	if !reflect.DeepEqual(jsn, actual) {
+		t.Fatalf("Expected reader's read to be %v but got: %v", jsn, actual)
+	}
+}
+
+func TestTruncate(t *testing.T) {
+	ctx := context.Background()
+	store := NewFromObject(map[string]interface{}{})
+	txn := storage.NewTransactionOrDie(ctx, store, storage.WriteParams)
+
+	var archiveFiles = map[string]string{
+		"/a/b/c/data.json":   "[1,2,3]",
+		"/a/b/d/data.json":   "true",
+		"/data.json":         `{"x": {"y": true}, "a": {"b": {"z": true}}}}`,
+		"/a/b/y/data.yaml":   `foo: 1`,
+		"/policy.rego":       "package foo\n p = 1",
+		"/roles/policy.rego": "package bar\n p = 1",
+	}
+
+	var files [][2]string
+	for name, content := range archiveFiles {
+		files = append(files, [2]string{name, content})
+	}
+
+	buf := archive.MustWriteTarGz(files)
+	b, err := bundle.NewReader(buf).WithLazyLoadingMode(true).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iterator := bundle.NewIterator(b.Raw)
+
+	err = store.Truncate(ctx, txn, storage.WriteParams, iterator)
+	if err != nil {
+		t.Fatalf("Unexpected truncate error: %v", err)
+	}
+
+	if err := store.Commit(ctx, txn); err != nil {
+		t.Fatalf("Unexpected commit error: %v", err)
+	}
+
+	txn = storage.NewTransactionOrDie(ctx, store)
+
+	actual, err := store.Read(ctx, txn, storage.MustParsePath("/"))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expected := `
+{
+	"a": {
+		"b": {
+			"c": [1,2,3],
+			"d": true,
+			"y": {
+				"foo": 1
+			},
+			"z": true
+		}
+	},
+	"x": {
+		"y": true
+	}
+}
+`
+	jsn := util.MustUnmarshalJSON([]byte(expected))
+
+	if !reflect.DeepEqual(jsn, actual) {
+		t.Fatalf("Expected reader's read to be %v but got: %v", jsn, actual)
+	}
+
+	store.Abort(ctx, txn)
+
+	txn = storage.NewTransactionOrDie(ctx, store)
+	ids, err := store.ListPolicies(ctx, txn)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	expectedIds := map[string]struct{}{"/policy.rego": {}, "/roles/policy.rego": {}}
+
+	for _, id := range ids {
+		if _, ok := expectedIds[id]; !ok {
+			t.Fatalf("Expected list policies to contain %v but got: %v", id, expectedIds)
+		}
+	}
+
+	bs, err := store.GetPolicy(ctx, txn, "/policy.rego")
+	expectedBytes := []byte("package foo\n p = 1")
+	if err != nil || !reflect.DeepEqual(expectedBytes, bs) {
+		t.Fatalf("Expected get policy to return %v but got: %v (err: %v)", expectedBytes, bs, err)
+	}
+
+	bs, err = store.GetPolicy(ctx, txn, "/roles/policy.rego")
+	expectedBytes = []byte("package bar\n p = 1")
+	if err != nil || !reflect.DeepEqual(expectedBytes, bs) {
+		t.Fatalf("Expected get policy to return %v but got: %v (err: %v)", expectedBytes, bs, err)
+	}
+}
+
+func TestTruncateDataMergeError(t *testing.T) {
+	ctx := context.Background()
+	store := NewFromObject(map[string]interface{}{})
+	txn := storage.NewTransactionOrDie(ctx, store, storage.WriteParams)
+
+	var archiveFiles = map[string]string{
+		"/a/b/data.json": `{"c": "foo"}`,
+		"/data.json":     `{"a": {"b": {"c": "bar"}}}`,
+	}
+
+	var files [][2]string
+	for name, content := range archiveFiles {
+		files = append(files, [2]string{name, content})
+	}
+
+	buf := archive.MustWriteTarGz(files)
+	b, err := bundle.NewReader(buf).WithLazyLoadingMode(true).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iterator := bundle.NewIterator(b.Raw)
+
+	err = store.Truncate(ctx, txn, storage.WriteParams, iterator)
+	if err == nil {
+		t.Fatal("Expected truncate error but got nil")
+	}
+
+	expected := "failed to insert data file from path a/b"
+	if err.Error() != expected {
+		t.Fatalf("Expected error %v but got %v", expected, err.Error())
+	}
+}
+
+func TestTruncateBadRootWrite(t *testing.T) {
+	ctx := context.Background()
+	store := NewFromObject(map[string]interface{}{})
+	txn := storage.NewTransactionOrDie(ctx, store, storage.WriteParams)
+
+	var archiveFiles = map[string]string{
+		"/a/b/d/data.json":   "true",
+		"/data.json":         "[1,2,3]",
+		"/roles/policy.rego": "package bar\n p = 1",
+	}
+
+	var files [][2]string
+	for name, content := range archiveFiles {
+		files = append(files, [2]string{name, content})
+	}
+
+	buf := archive.MustWriteTarGz(files)
+	b, err := bundle.NewReader(buf).WithLazyLoadingMode(true).Read()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	iterator := bundle.NewIterator(b.Raw)
+
+	err = store.Truncate(ctx, txn, storage.WriteParams, iterator)
+	if err == nil {
+		t.Fatal("Expected truncate error but got nil")
+	}
+
+	expected := "storage_invalid_patch_error: root must be object"
+	if err.Error() != expected {
+		t.Fatalf("Expected error %v but got %v", expected, err.Error())
+	}
+}
+
 func TestInMemoryTxnWriteFailures(t *testing.T) {
 
 	ctx := context.Background()
@@ -337,6 +564,7 @@ func TestInMemoryTxnWriteFailures(t *testing.T) {
 		{storage.AddOp, "/a/0/beef", "", storage.NotFoundErr},
 		{storage.AddOp, "/arr", `[1,2,3]`, ""},
 		{storage.AddOp, "/arr/0/foo", "", storage.NotFoundErr},
+		{storage.AddOp, "/arr/4", "", storage.NotFoundErr},
 	}
 
 	for _, w := range writes {
@@ -604,7 +832,7 @@ func TestInMemoryContext(t *testing.T) {
 	}
 
 	_, err = store.Register(ctx, txn, storage.TriggerConfig{
-		OnCommit: func(ctx context.Context, txn storage.Transaction, event storage.TriggerEvent) {
+		OnCommit: func(_ context.Context, _ storage.Transaction, event storage.TriggerEvent) {
 			if event.Context.Get("foo") != "bar" {
 				t.Fatalf("Expected foo/bar in context but got: %+v", event.Context)
 			} else if event.Context.Get("deadbeef") != nil {

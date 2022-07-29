@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"reflect"
 	"testing"
 
@@ -309,6 +310,8 @@ func TestExprString(t *testing.T) {
 		},
 	}
 	expr9 := Contains.Expr(StringTerm("foo.bar"), StringTerm("."))
+	expr10 := Member.Expr(StringTerm("foo"), VarTerm("xs"))
+	expr11 := MemberWithKey.Expr(VarTerm("x"), StringTerm("foo"), VarTerm("xs"))
 	assertExprString(t, expr1, "q.r[x]")
 	assertExprString(t, expr2, "not q.r[x]")
 	assertExprString(t, expr3, "\"a\" = 17.1")
@@ -318,6 +321,8 @@ func TestExprString(t *testing.T) {
 	assertExprString(t, expr7, "count(\"foo\", x)")
 	assertExprString(t, expr8, "data.test.f(1, x)")
 	assertExprString(t, expr9, `contains("foo.bar", ".")`)
+	assertExprString(t, expr10, `internal.member_2("foo", xs)`)
+	assertExprString(t, expr11, `internal.member_3(x, "foo", xs)`)
 }
 
 func TestExprBadJSON(t *testing.T) {
@@ -370,6 +375,21 @@ func TestExprBadJSON(t *testing.T) {
 	}`
 	exp = fmt.Errorf("ast: unable to unmarshal index field with type: <nil> (expected integer)")
 	assert(js, exp)
+}
+
+func TestExprEveryCopy(t *testing.T) {
+	opts := ParserOptions{AllFutureKeywords: true}
+	newEvery := func() *Expr {
+		return MustParseBodyWithOpts(
+			`every k, v in [1,2,3] { true }`, opts,
+		)[0]
+	}
+	e0 := newEvery()
+	e1 := e0.Copy()
+	e1.Terms.(*Every).Body = NewBody(NewExpr(BooleanTerm(false)))
+	if exp := newEvery(); exp.Compare(e0) != 0 {
+		t.Errorf("expected e0 unchanged (%v), found %v", exp, e0)
+	}
 }
 
 func TestRuleHeadEquals(t *testing.T) {
@@ -540,28 +560,134 @@ func TestSomeDeclString(t *testing.T) {
 	expected := "some a, b"
 
 	if result != expected {
-		t.Fatalf("Expected %v but got %v", expected, result)
+		t.Errorf("Expected %v but got %v", expected, result)
+	}
+
+	s := &SomeDecl{
+		Symbols: []*Term{Member.Call(VarTerm("x"), VarTerm("xs"))},
+	}
+	if exp, act := "some x in xs", s.String(); act != exp {
+		t.Errorf("Expected %v but got %v", exp, act)
+	}
+
+	s1 := &SomeDecl{
+		Symbols: []*Term{Member.Call(VarTerm("x"), VarTerm("y"), VarTerm("xs"))},
+	}
+	if exp, act := "some x, y in xs", s1.String(); act != exp {
+		t.Errorf("Expected %v but got %v", exp, act)
+	}
+}
+
+func TestEveryString(t *testing.T) {
+	tests := []struct {
+		every Every
+		exp   string
+	}{
+		{
+			exp: `every x in ["foo", "bar"] { true; true }`,
+			every: Every{
+				Value:  VarTerm("x"),
+				Domain: ArrayTerm(StringTerm("foo"), StringTerm("bar")),
+				Body: []*Expr{
+					{
+						Terms: BooleanTerm(true),
+					},
+					{
+						Terms: BooleanTerm(true),
+					},
+				},
+			},
+		},
+		{
+			exp: `every k, v in ["foo", "bar"] { true; true }`,
+			every: Every{
+				Key:    VarTerm("k"),
+				Value:  VarTerm("v"),
+				Domain: ArrayTerm(StringTerm("foo"), StringTerm("bar")),
+				Body: []*Expr{
+					{
+						Terms: BooleanTerm(true),
+					},
+					{
+						Terms: BooleanTerm(true),
+					},
+				},
+			},
+		},
+	}
+	for _, tc := range tests {
+		if act := tc.every.String(); act != tc.exp {
+			t.Errorf("expected %q, got %q", tc.exp, act)
+		}
 	}
 }
 
 func TestAnnotationsString(t *testing.T) {
 	a := &Annotations{
-		Scope: "foo",
+		Scope:       "foo",
+		Title:       "bar",
+		Description: "baz",
+		Authors: []*AuthorAnnotation{
+			{
+				Name:  "John Doe",
+				Email: "john@example.com",
+			},
+			{
+				Name: "Jane Doe",
+			},
+		},
+		Organizations: []string{"mi", "fa"},
+		RelatedResources: []*RelatedResourceAnnotation{
+			{
+				Ref: mustParseURL("https://example.com"),
+			},
+			{
+				Ref:         mustParseURL("https://example.com/2"),
+				Description: "Some resource",
+			},
+		},
 		Schemas: []*SchemaAnnotation{
 			{
 				Path:   MustParseRef("data.bar"),
 				Schema: MustParseRef("schema.baz"),
 			},
 		},
+		Custom: map[string]interface{}{
+			"list": []int{
+				1, 2, 3,
+			},
+			"map": map[string]interface{}{
+				"one": 1,
+				"two": map[int]interface{}{
+					3: "three",
+				},
+			},
+			"flag": true,
+		},
 	}
 
 	// NOTE(tsandall): for now, annotations are represented as JSON objects
 	// which are a subset of YAML. We could improve this in the future.
-	exp := `{"scope":"foo","schemas":[{"path":[{"type":"var","value":"data"},{"type":"string","value":"bar"}],"schema":[{"type":"var","value":"schema"},{"type":"string","value":"baz"}]}]}`
+	exp := `{"scope":"foo",` +
+		`"title":"bar",` +
+		`"description":"baz",` +
+		`"organizations":["mi","fa"],` +
+		`"related_resources":[{"ref":"https://example.com"},{"description":"Some resource","ref":"https://example.com/2"}],` +
+		`"authors":[{"name":"John Doe","email":"john@example.com"},{"name":"Jane Doe"}],` +
+		`"schemas":[{"path":[{"type":"var","value":"data"},{"type":"string","value":"bar"}],"schema":[{"type":"var","value":"schema"},{"type":"string","value":"baz"}]}],` +
+		`"custom":{"flag":true,"list":[1,2,3],"map":{"one":1,"two":{"3":"three"}}}}`
 
 	if exp != a.String() {
 		t.Fatalf("expected %q but got %q", exp, a.String())
 	}
+}
+
+func mustParseURL(str string) url.URL {
+	parsed, err := url.Parse(str)
+	if err != nil {
+		panic(err)
+	}
+	return *parsed
 }
 
 func TestModuleStringAnnotations(t *testing.T) {

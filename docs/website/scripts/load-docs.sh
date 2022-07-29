@@ -1,6 +1,6 @@
 #!/bin/bash
 
-set -xe
+set -e
 
 ORIGINAL_COMMIT=$(git symbolic-ref -q --short HEAD || git name-rev --name-only HEAD)
 # If no name can be found "git name-rev" returns
@@ -23,13 +23,18 @@ ALL_RELEASES=$(git tag -l | sort -r -V)
 RELEASES=()
 PREV_MAJOR_VER="-1"
 PREV_MINOR_VER="-1"
+
+if [[ ${DEV} != "" ]]; then
+    ALL_RELEASES=()
+fi
+
 for release in ${ALL_RELEASES}; do
     CUR_SEM_VER=${release#"v"}
 
     # ignore any release candidate versions, for now if they
     # are the "latest" they'll be documented under "edge"
     if [[ "${CUR_SEM_VER}" == *"rc"* ]]; then
-      continue
+        continue
     fi
 
     SEMVER_REGEX='[^0-9]*\([0-9]*\)[.]\([0-9]*\)[.]\([0-9]*\)\([0-9A-Za-z-]*\)'
@@ -44,11 +49,20 @@ for release in ${ALL_RELEASES}; do
         continue
     fi
 
+    # ignore the tag if there is no corresponding OPA binary available on the GitHub Release page
+    BINARY_URL=https://github.com/open-policy-agent/opa/releases/download/${release}/opa_linux_amd64
+    curl_exit_code=0
+    curl --silent --location --head --fail $BINARY_URL >/dev/null || curl_exit_code=$?
+    if [[ $curl_exit_code -ne 0 ]]; then
+        echo "WARNING: skipping $release because $BINARY_URL does not exist (or GET failed...)"
+        continue
+    fi
+
     # The releases are sorted in order by semver from newest to oldest, and we only want
     # the latest point release for each minor version
     if [[ "${CUR_MAJOR_VER}" != "${PREV_MAJOR_VER}" || \
-             ("${CUR_MAJOR_VER}" = "${PREV_MAJOR_VER}" && \
-                "${CUR_MINOR_VER}" != "${PREV_MINOR_VER}") ]]; then
+            ("${CUR_MAJOR_VER}" = "${PREV_MAJOR_VER}" && \
+            "${CUR_MINOR_VER}" != "${PREV_MINOR_VER}") ]]; then
         RELEASES+=(${release})
     fi
 
@@ -57,36 +71,7 @@ for release in ${ALL_RELEASES}; do
 done
 
 echo "Git version: ${GIT_VERSION}"
-
-echo "Saving current workspace state"
-STASH_TOKEN=$(cat /dev/urandom | LC_CTYPE=C tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)
-git stash push --include-untracked -m "${STASH_TOKEN}"
-
-function restore_tree {
-    echo "Returning to commit ${ORIGINAL_COMMIT}"
-    git checkout ${ORIGINAL_COMMIT}
-
-    # Only pop from the stash if we had stashed something earlier
-    if [[ -n "$(git stash list | head -1 | grep ${STASH_TOKEN} || echo '')" ]]; then
-        git stash pop
-    fi
-}
-
-function cleanup {
-    EXIT_CODE=$?
-
-    if [[ "${EXIT_CODE}" != "0" ]]; then
-        # on errors attempt to restore the starting tree state
-        restore_tree
-
-        echo "Error loading docs"
-        exit ${EXIT_CODE}
-    fi
-
-    echo "Docs loading complete"
-}
-
-trap cleanup EXIT
+echo "Releases to consider: ${RELEASES[*]}"
 
 echo "Cleaning generated folder"
 rm -rf ${ROOT_DIR}/docs/website/generated/*
@@ -96,19 +81,20 @@ rm -f ${RELEASES_YAML_FILE}
 
 mkdir -p $(dirname ${RELEASES_YAML_FILE})
 
-echo 'Adding "latest" version to releases.yaml'
-echo "- latest" > ${RELEASES_YAML_FILE}
+if [[ ${DEV} == "" ]]; then
+    echo 'Adding "latest" version to releases.yaml'
+    echo "- latest" > ${RELEASES_YAML_FILE}
+fi
 
 for release in "${RELEASES[@]}"; do
     version_docs_dir=${ROOT_DIR}/docs/website/generated/docs/${release}
-
     mkdir -p ${version_docs_dir}
 
     echo "Checking out release ${release}"
 
     # Don't error if the checkout fails
     set +e
-    git checkout ${release}
+    git archive --format=tar ${release} content | tar x -C ${version_docs_dir} --strip-components=1
     errc=$?
     set -e
 
@@ -120,14 +106,7 @@ for release in "${RELEASES[@]}"; do
     else
         echo "WARNING: Failed to check out version ${version}!!"
     fi
-
-    echo "Copying doc content from tag ${release}"
-    cp -r ${ROOT_DIR}/docs/content/* ${version_docs_dir}/
-
 done
-
-# Go back to the original tree state
-restore_tree
 
 # Create the "edge" version from current working tree
 echo 'Adding "edge" to releases.yaml'
@@ -135,7 +114,10 @@ echo "- edge" >> ${RELEASES_YAML_FILE}
 
 # Link instead of copy so we don't need to re-generate each time.
 # Use a relative link so it works in a container more easily.
+mkdir -p ${ROOT_DIR}/docs/website/generated/docs
 ln -s ../../../content ${ROOT_DIR}/docs/website/generated/docs/edge
 
 # Create a "latest" version from the latest semver found
-ln -s ${ROOT_DIR}/docs/website/generated/docs/${RELEASES[0]} ${ROOT_DIR}/docs/website/generated/docs/latest
+if [[ ${DEV} == "" ]]; then
+    cp -r ${ROOT_DIR}/docs/website/generated/docs/${RELEASES[0]} ${ROOT_DIR}/docs/website/generated/docs/latest
+fi

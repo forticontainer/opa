@@ -36,24 +36,44 @@ func TestPrettyReporterVerbose(t *testing.T) {
 			Package: "data.foo.bar",
 			Name:    "test_baz",
 			Trace:   getFakeTraceEvents(),
+			Location: &ast.Location{
+				File: "policy1.rego",
+			},
 		},
 		{
 			Package: "data.foo.bar",
 			Name:    "test_qux",
 			Error:   fmt.Errorf("some err"),
 			Trace:   getFakeTraceEvents(),
+			Location: &ast.Location{
+				File: "policy1.rego",
+			},
 		},
 		{
 			Package: "data.foo.bar",
 			Name:    "test_corge",
 			Fail:    true,
 			Trace:   getFakeTraceEvents(),
+			Location: &ast.Location{
+				File: "policy2.rego",
+			},
 		},
 		{
 			Package: "data.foo.bar",
 			Name:    "todo_test_qux",
 			Skip:    true,
 			Trace:   nil,
+			Location: &ast.Location{
+				File: "policy2.rego",
+			},
+		},
+		{
+			Package: "data.foo.bar",
+			Name:    "test_contains_print",
+			Output:  []byte("fake print output\n"),
+			Location: &ast.Location{
+				File: "policy3.rego",
+			},
 		},
 	}
 
@@ -75,20 +95,31 @@ data.foo.bar.test_corge: FAIL (0s)
 
 SUMMARY
 --------------------------------------------------------------------------------
+policy1.rego:
 data.foo.bar.test_baz: PASS (0s)
 data.foo.bar.test_qux: ERROR (0s)
   some err
+
+policy2.rego:
 data.foo.bar.test_corge: FAIL (0s)
 data.foo.bar.todo_test_qux: SKIPPED
+
+policy3.rego:
+data.foo.bar.test_contains_print: PASS (0s)
+
+  fake print output
+
 --------------------------------------------------------------------------------
-PASS: 1/4
-FAIL: 1/4
-SKIPPED: 1/4
-ERROR: 1/4
+PASS: 2/5
+FAIL: 1/5
+SKIPPED: 1/5
+ERROR: 1/5
 `
 
-	if exp != buf.String() {
-		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp, buf.String())
+	str := buf.String()
+
+	if exp != str {
+		t.Fatalf("Expected (%d bytes):\n\n%v\n\nGot (%d bytes):\n\n%v", len(exp), exp, len(str), str)
 	}
 }
 
@@ -102,24 +133,53 @@ func TestPrettyReporter(t *testing.T) {
 			Package: "data.foo.bar",
 			Name:    "test_baz",
 			Trace:   getFakeTraceEvents(),
+			Location: &ast.Location{
+				File: "policy1.rego",
+			},
 		},
 		{
 			Package: "data.foo.bar",
 			Name:    "test_qux",
 			Error:   fmt.Errorf("some err"),
 			Trace:   getFakeTraceEvents(),
+			Location: &ast.Location{
+				File: "policy1.rego",
+			},
 		},
 		{
 			Package: "data.foo.bar",
 			Name:    "test_corge",
 			Fail:    true,
 			Trace:   getFakeTraceEvents(),
+			Location: &ast.Location{
+				File: "policy1.rego",
+			},
 		},
 		{
 			Package: "data.foo.bar",
 			Name:    "todo_test_qux",
 			Skip:    true,
 			Trace:   nil,
+			Location: &ast.Location{
+				File: "policy1.rego",
+			},
+		},
+		{
+			Package: "data.foo.bar",
+			Name:    "test_contains_print_pass",
+			Output:  []byte("fake print output\n"),
+			Location: &ast.Location{
+				File: "policy1.rego",
+			},
+		},
+		{
+			Package: "data.foo.bar",
+			Name:    "test_contains_print_fail",
+			Fail:    true,
+			Output:  []byte("fake print output2\n"),
+			Location: &ast.Location{
+				File: "policy2.rego",
+			},
 		},
 	}
 
@@ -132,15 +192,22 @@ func TestPrettyReporter(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	exp := `data.foo.bar.test_qux: ERROR (0s)
+	exp := `policy1.rego:
+data.foo.bar.test_qux: ERROR (0s)
   some err
 data.foo.bar.test_corge: FAIL (0s)
 data.foo.bar.todo_test_qux: SKIPPED
+
+policy2.rego:
+data.foo.bar.test_contains_print_fail: FAIL (0s)
+
+  fake print output2
+
 --------------------------------------------------------------------------------
-PASS: 1/4
-FAIL: 1/4
-SKIPPED: 1/4
-ERROR: 1/4
+PASS: 2/6
+FAIL: 2/6
+SKIPPED: 1/6
+ERROR: 1/6
 `
 
 	if exp != buf.String() {
@@ -173,6 +240,11 @@ func TestJSONReporter(t *testing.T) {
 			Name:    "todo_test_qux",
 			Skip:    true,
 			Trace:   nil,
+		},
+		{
+			Package: "data.foo.bar",
+			Name:    "test_contains_print",
+			Output:  []byte("fake print output\n"),
 		},
 	}
 
@@ -327,6 +399,13 @@ func TestJSONReporter(t *testing.T) {
     "name": "todo_test_qux",
     "skip": true,
     "duration": 0
+  },
+  {
+	  "location": null,
+	  "package": "data.foo.bar",
+	  "name": "test_contains_print",
+	  "output": "ZmFrZSBwcmludCBvdXRwdXQK",
+	  "duration": 0
   }
 ]
 `))

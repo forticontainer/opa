@@ -18,7 +18,6 @@ import (
 	"sync"
 	"time"
 
-	"github.com/pkg/errors"
 	"golang.org/x/time/rate"
 
 	"github.com/open-policy-agent/opa/ast"
@@ -45,20 +44,21 @@ type Logger interface {
 // the struct. Any changes here MUST be reflected in the AST()
 // implementation below.
 type EventV1 struct {
-	Labels      map[string]string       `json:"labels"`
-	DecisionID  string                  `json:"decision_id"`
-	Revision    string                  `json:"revision,omitempty"` // Deprecated: Use Bundles instead
-	Bundles     map[string]BundleInfoV1 `json:"bundles,omitempty"`
-	Path        string                  `json:"path,omitempty"`
-	Query       string                  `json:"query,omitempty"`
-	Input       *interface{}            `json:"input,omitempty"`
-	Result      *interface{}            `json:"result,omitempty"`
-	Erased      []string                `json:"erased,omitempty"`
-	Masked      []string                `json:"masked,omitempty"`
-	Error       error                   `json:"error,omitempty"`
-	RequestedBy string                  `json:"requested_by"`
-	Timestamp   time.Time               `json:"timestamp"`
-	Metrics     map[string]interface{}  `json:"metrics,omitempty"`
+	Labels       map[string]string       `json:"labels"`
+	DecisionID   string                  `json:"decision_id"`
+	Revision     string                  `json:"revision,omitempty"` // Deprecated: Use Bundles instead
+	Bundles      map[string]BundleInfoV1 `json:"bundles,omitempty"`
+	Path         string                  `json:"path,omitempty"`
+	Query        string                  `json:"query,omitempty"`
+	Input        *interface{}            `json:"input,omitempty"`
+	Result       *interface{}            `json:"result,omitempty"`
+	MappedResult *interface{}            `json:"mapped_result,omitempty"`
+	Erased       []string                `json:"erased,omitempty"`
+	Masked       []string                `json:"masked,omitempty"`
+	Error        error                   `json:"error,omitempty"`
+	RequestedBy  string                  `json:"requested_by,omitempty"`
+	Timestamp    time.Time               `json:"timestamp"`
+	Metrics      map[string]interface{}  `json:"metrics,omitempty"`
 
 	inputAST ast.Value
 }
@@ -86,6 +86,7 @@ var pathKey = ast.StringTerm("path")
 var queryKey = ast.StringTerm("query")
 var inputKey = ast.StringTerm("input")
 var resultKey = ast.StringTerm("result")
+var mappedResultKey = ast.StringTerm("mapped_result")
 var erasedKey = ast.StringTerm("erased")
 var maskedKey = ast.StringTerm("masked")
 var errorKey = ast.StringTerm("error")
@@ -150,6 +151,14 @@ func (e *EventV1) AST() (ast.Value, error) {
 		event.Insert(resultKey, ast.NewTerm(results))
 	}
 
+	if e.MappedResult != nil {
+		mResults, err := roundtripJSONToAST(e.MappedResult)
+		if err != nil {
+			return nil, err
+		}
+		event.Insert(mappedResultKey, ast.NewTerm(mResults))
+	}
+
 	if len(e.Erased) > 0 {
 		erased := make([]*ast.Term, len(e.Erased))
 		for i, v := range e.Erased {
@@ -174,7 +183,9 @@ func (e *EventV1) AST() (ast.Value, error) {
 		event.Insert(errorKey, ast.NewTerm(evalErr))
 	}
 
-	event.Insert(requestedByKey, ast.StringTerm(e.RequestedBy))
+	if len(e.RequestedBy) > 0 {
+		event.Insert(requestedByKey, ast.StringTerm(e.RequestedBy))
+	}
 
 	// Use the timestamp JSON marshaller to ensure the format is the same as
 	// round tripping through JSON.
@@ -274,13 +285,9 @@ func (c *Config) validateAndInjectDefaults(services []string, pluginsList []stri
 		}
 	}
 
-	if c.Plugin == nil && c.Service == "" && !c.ConsoleLogs {
-		return fmt.Errorf("invalid decision_log config, must have a `service`, `plugin`, or `console` logging enabled")
-	}
-
 	t, err := plugins.ValidateAndInjectDefaultsForTriggerMode(trigger, c.Reporting.Trigger)
 	if err != nil {
-		return errors.Wrap(err, "invalid decision_log config")
+		return fmt.Errorf("invalid decision_log config: %w", err)
 	}
 	c.Reporting.Trigger = t
 
@@ -334,7 +341,7 @@ func (c *Config) validateAndInjectDefaults(services []string, pluginsList []stri
 
 	c.maskDecisionRef, err = ref.ParseDataPath(*c.MaskDecision)
 	if err != nil {
-		return errors.Wrap(err, "invalid mask_decision in decision_logs")
+		return fmt.Errorf("invalid mask_decision in decision_logs: %w", err)
 	}
 
 	if c.PartitionName != "" {
@@ -376,7 +383,12 @@ type reconfigure struct {
 // ParseConfig validates the config and injects default values.
 func ParseConfig(config []byte, services []string, pluginList []string) (*Config, error) {
 	t := plugins.DefaultTriggerMode
-	return NewConfigBuilder().WithBytes(config).WithServices(services).WithPlugins(pluginList).WithTriggerMode(&t).Parse()
+	return NewConfigBuilder().
+		WithBytes(config).
+		WithServices(services).
+		WithPlugins(pluginList).
+		WithTriggerMode(&t).
+		Parse()
 }
 
 // ConfigBuilder assists in the construction of the plugin configuration.
@@ -428,6 +440,11 @@ func (b *ConfigBuilder) Parse() (*Config, error) {
 		return nil, err
 	}
 
+	if parsedConfig.Plugin == nil && parsedConfig.Service == "" && len(b.services) == 0 && !parsedConfig.ConsoleLogs {
+		// Nothing to validate or inject
+		return nil, nil
+	}
+
 	if err := parsedConfig.validateAndInjectDefaults(b.services, b.plugins, b.trigger); err != nil {
 		return nil, err
 	}
@@ -463,6 +480,7 @@ func New(parsedConfig *Config, manager *plugins.Manager) *Plugin {
 // WithMetrics sets the global metrics provider to be used by the plugin.
 func (p *Plugin) WithMetrics(m metrics.Metrics) *Plugin {
 	p.metrics = m
+	p.enc.WithMetrics(m)
 	return p
 }
 
@@ -539,17 +557,18 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 	}
 
 	event := EventV1{
-		Labels:      p.manager.Labels(),
-		DecisionID:  decision.DecisionID,
-		Revision:    decision.Revision,
-		Bundles:     bundles,
-		Path:        decision.Path,
-		Query:       decision.Query,
-		Input:       decision.Input,
-		Result:      decision.Results,
-		RequestedBy: decision.RemoteAddr,
-		Timestamp:   decision.Timestamp,
-		inputAST:    decision.InputAST,
+		Labels:       p.manager.Labels(),
+		DecisionID:   decision.DecisionID,
+		Revision:     decision.Revision,
+		Bundles:      bundles,
+		Path:         decision.Path,
+		Query:        decision.Query,
+		Input:        decision.Input,
+		Result:       decision.Results,
+		MappedResult: decision.MappedResults,
+		RequestedBy:  decision.RemoteAddr,
+		Timestamp:    decision.Timestamp,
+		inputAST:     decision.InputAST,
 	}
 
 	if decision.Metrics != nil {
@@ -574,18 +593,18 @@ func (p *Plugin) Log(ctx context.Context, decision *server.Info) error {
 		}
 	}
 
+	if p.config.Service != "" {
+		p.mtx.Lock()
+		p.encodeAndBufferEvent(event)
+		p.mtx.Unlock()
+	}
+
 	if p.config.Plugin != nil {
 		proxy, ok := p.manager.Plugin(*p.config.Plugin).(Logger)
 		if !ok {
 			return fmt.Errorf("plugin does not implement Logger interface")
 		}
 		return proxy.Log(ctx, event)
-	}
-
-	if p.config.Service != "" {
-		p.mtx.Lock()
-		defer p.mtx.Unlock()
-		p.encodeAndBufferEvent(event)
 	}
 
 	return nil
@@ -632,7 +651,7 @@ func (p *Plugin) Trigger(ctx context.Context) error {
 // compilerUpdated is called when a compiler trigger on the plugin manager
 // fires. This indicates a new compiler instance is available. The decision
 // logger needs to prepare a new masking query.
-func (p *Plugin) compilerUpdated(txn storage.Transaction) {
+func (p *Plugin) compilerUpdated(storage.Transaction) {
 	p.maskMutex.Lock()
 	defer p.maskMutex.Unlock()
 	p.mask = nil
@@ -642,9 +661,10 @@ func (p *Plugin) loop() {
 
 	ctx, cancel := context.WithCancel(context.Background())
 
+	var retry int
+
 	for {
 
-		var retry int
 		var waitC chan struct{}
 
 		if *p.config.Reporting.Trigger == plugins.TriggerPeriodic && p.config.Service != "" {
@@ -712,7 +732,7 @@ func (p *Plugin) oneShot(ctx context.Context) (ok bool, err error) {
 	oldChunkEnc := p.enc
 	oldBuffer := p.buffer
 	p.buffer = newLogBuffer(*p.config.Reporting.BufferSizeLimitBytes)
-	p.enc = newChunkEncoder(*p.config.Reporting.UploadSizeLimitBytes)
+	p.enc = newChunkEncoder(*p.config.Reporting.UploadSizeLimitBytes).WithMetrics(p.metrics)
 	p.mtx.Unlock()
 
 	// Along with uploading the compressed events in the buffer
@@ -721,8 +741,10 @@ func (p *Plugin) oneShot(ctx context.Context) (ok bool, err error) {
 	chunk, err := oldChunkEnc.Flush()
 	if err != nil {
 		return false, err
-	} else if chunk != nil {
-		p.bufferChunk(oldBuffer, chunk)
+	}
+
+	for _, ch := range chunk {
+		p.bufferChunk(oldBuffer, ch)
 	}
 
 	if oldBuffer.Len() == 0 {
@@ -792,8 +814,8 @@ func (p *Plugin) encodeAndBufferEvent(event EventV1) {
 		return
 	}
 
-	if result != nil {
-		p.bufferChunk(p.buffer, result)
+	for _, chunk := range result {
+		p.bufferChunk(p.buffer, chunk)
 	}
 }
 
@@ -821,6 +843,8 @@ func (p *Plugin) maskEvent(ctx context.Context, txn storage.Transaction, event *
 				rego.Store(p.manager.Store),
 				rego.Transaction(txn),
 				rego.Runtime(p.manager.Info),
+				rego.EnablePrintStatements(p.manager.EnablePrintStatements()),
+				rego.PrintHook(p.manager.PrintHook()),
 			)
 
 			pq, err := r.PrepareForEval(context.Background())
@@ -879,21 +903,16 @@ func uploadChunk(ctx context.Context, client rest.Client, uploadPath string, dat
 		Do(ctx, "POST", uploadPath)
 
 	if err != nil {
-		return errors.Wrap(err, "Log upload failed")
+		return fmt.Errorf("log upload failed: %w", err)
 	}
 
 	defer util.Close(resp)
 
-	switch resp.StatusCode {
-	case http.StatusOK:
-		return nil
-	case http.StatusNotFound:
-		return fmt.Errorf("Log upload failed, server replied with not found")
-	case http.StatusUnauthorized:
-		return fmt.Errorf("Log upload failed, server replied with not authorized")
-	default:
-		return fmt.Errorf("Log upload failed, server replied with HTTP %v", resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("log upload failed, server replied with HTTP %v %v", resp.StatusCode, http.StatusText(resp.StatusCode))
 	}
+
+	return nil
 }
 
 func (p *Plugin) logEvent(event EventV1) error {

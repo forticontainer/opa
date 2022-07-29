@@ -193,12 +193,41 @@ func TestOutputVarsForNode(t *testing.T) {
 			query: "{x, 2}[1] = y",
 			exp:   `set()`,
 		},
+		{
+			note:  "nested function calls",
+			query: `z = "abc"; x = split(z, "")[y]`,
+			exp:   `{x, y, z}`,
+		},
+		{
+			note:  "unsafe nested function calls",
+			query: `z = "abc"; x = split(z, a)[y]`,
+			exp:   `{z}`,
+		},
+		{
+			note:  "every: simple: no output vars",
+			query: `every k, v in [1, 2] { k < v }`,
+			exp:   `set()`,
+		},
+		{
+			note:  "every: output vars in domain",
+			query: `xs = []; every k, v in xs[i] { k < v }`,
+			exp:   `{xs, i}`,
+		},
+		{
+			note:  "every: output vars in body",
+			query: `every k, v in [] { k < v; i = 1 }`,
+			exp:   `set()`,
+		},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.note, func(t *testing.T) {
 
-			body := MustParseBody(tc.query)
+			opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
+			body, err := ParseBodyWithOpts(tc.query, opts)
+			if err != nil {
+				t.Fatal(err)
+			}
 			arity := func(r Ref) int {
 				a, ok := tc.arities[r.String()]
 				if !ok {
@@ -663,15 +692,18 @@ func TestCompilerCheckSafetyBodyReordering(t *testing.T) {
 		contains(x, "oo")
 	`},
 		{"userfunc", `split(y, ".", z); data.a.b.funcs.fn("...foo.bar..", y)`, `data.a.b.funcs.fn("...foo.bar..", y); split(y, ".", z)`},
+		{"every", `every _ in [] { x != 1 }; x = 1`, `__local4__ = []; x = 1; every __local3__, _ in __local4__ { x != 1}`},
+		{"every-domain", `every _ in xs { true }; xs = [1]`, `xs = [1]; __local4__ = xs; every __local3__, _ in __local4__ { true }`},
 	}
 
 	for i, tc := range tests {
 		t.Run(tc.note, func(t *testing.T) {
+			opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
 			c := NewCompiler()
 			c.Modules = getCompilerTestModules()
-			c.Modules["reordering"] = MustParseModule(fmt.Sprintf(
+			c.Modules["reordering"] = MustParseModuleWithOpts(fmt.Sprintf(
 				`package test
-				p { %s }`, tc.body))
+				p { %s }`, tc.body), opts)
 
 			compileStages(c, c.checkSafetyRuleBodies)
 
@@ -680,7 +712,7 @@ func TestCompilerCheckSafetyBodyReordering(t *testing.T) {
 				return
 			}
 
-			expected := MustParseBody(tc.expected)
+			expected := MustParseBodyWithOpts(tc.expected, opts)
 			result := c.Modules["reordering"].Rules[0].Body
 
 			if !expected.Equal(result) {
@@ -691,43 +723,78 @@ func TestCompilerCheckSafetyBodyReordering(t *testing.T) {
 }
 
 func TestCompilerCheckSafetyBodyReorderingClosures(t *testing.T) {
-	c := NewCompiler()
-	c.Modules = map[string]*Module{
-		"mod": MustParseModule(
-			`package compr
+	opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
+
+	tests := []struct {
+		note string
+		mod  *Module
+		exp  Body
+	}{
+		{
+			note: "comprehensions-1",
+			mod: MustParseModule(`package compr
 
 import data.b
 import data.c
+p = true { v = [null | true]; xs = [x | a[i] = x; a = [y | y != 1; y = c[j]]]; xs[j] > 0; z = [true | data.a.b.d.t with input as i2; i2 = i]; b[i] = j }
+`),
+			exp: MustParseBody(`v = [null | true]; data.b[i] = j; xs = [x | a = [y | y = data.c[j]; y != 1]; a[i] = x]; xs[j] > 0; z = [true | i2 = i; data.a.b.d.t with input as i2]`),
+		},
+		{
+			note: "comprehensions-2",
+			mod: MustParseModule(`package compr
 
+import data.b
+import data.c
+q = true { _ = [x | x = b[i]]; _ = b[j]; _ = [x | x = true; x != false]; true != false; _ = [x | data.foo[_] = x]; data.foo[_] = _ }
+`),
+			exp: MustParseBody(`_ = [x | x = data.b[i]]; _ = data.b[j]; _ = [x | x = true; x != false]; true != false; _ = [x | data.foo[_] = x]; data.foo[_] = _`),
+		},
+
+		{
+			note: "comprehensions-3",
+			mod: MustParseModule(`package compr
+
+import data.b
+import data.c
 fn(x) = y {
 	trim(x, ".", y)
 }
+r = true { a = [x | split(y, ".", z); x = z[i]; fn("...foo.bar..", y)] }
+`),
+			exp: MustParseBody(`a = [x | data.compr.fn("...foo.bar..", y); split(y, ".", z); x = z[i]]`),
+		},
+		{
+			note: "closure over function output",
+			mod: MustParseModule(`package test
+import future.keywords
 
-p = true { v = [null | true]; xs = [x | a[i] = x; a = [y | y != 1; y = c[j]]]; xs[j] > 0; z = [true | data.a.b.d.t with input as i2; i2 = i]; b[i] = j }
-q = true { _ = [x | x = b[i]]; _ = b[j]; _ = [x | x = true; x != false]; true != false; _ = [x | data.foo[_] = x]; data.foo[_] = _ }
-r = true { a = [x | split(y, ".", z); x = z[i]; fn("...foo.bar..", y)] }`,
-		),
+p {
+	object.get(input.subject.roles[_], comp, [""], output)
+	comp = [ 1 | true ]
+	every y in [2] {
+		y in output
+	}
+}`),
+			exp: MustParseBodyWithOpts(`comp = [1 | true]
+				__local2__ = [2]
+				object.get(input.subject.roles[_], comp, [""], output)
+				every __local0__, __local1__ in __local2__ { internal.member_2(__local1__, output) }`, opts),
+		},
 	}
 
-	compileStages(c, c.checkSafetyRuleBodies)
-	assertNotFailed(t, c)
-
-	result1 := c.Modules["mod"].Rules[1].Body
-	expected1 := MustParseBody(`v = [null | true]; data.b[i] = j; xs = [x | a = [y | y = data.c[j]; y != 1]; a[i] = x]; z = [true | i2 = i; data.a.b.d.t with input as i2]; xs[j] > 0`)
-	if !result1.Equal(expected1) {
-		t.Errorf("Expected reordered body to be equal to:\n%v\nBut got:\n%v", expected1, result1)
-	}
-
-	result2 := c.Modules["mod"].Rules[2].Body
-	expected2 := MustParseBody(`_ = [x | x = data.b[i]]; _ = data.b[j]; _ = [x | x = true; x != false]; true != false; _ = [x | data.foo[_] = x]; data.foo[_] = _`)
-	if !result2.Equal(expected2) {
-		t.Errorf("Expected pre-ordered body to equal:\n%v\nBut got:\n%v", expected2, result2)
-	}
-
-	result3 := c.Modules["mod"].Rules[3].Body
-	expected3 := MustParseBody(`a = [x | data.compr.fn("...foo.bar..", y); split(y, ".", z); x = z[i]]`)
-	if !result3.Equal(expected3) {
-		t.Errorf("Expected pre-ordered body to equal:\n%v\nBut got:\n%v", expected3, result3)
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			c := NewCompiler()
+			c.Modules = map[string]*Module{"mod": tc.mod}
+			compileStages(c, c.checkSafetyRuleBodies)
+			assertNotFailed(t, c)
+			last := len(c.Modules["mod"].Rules) - 1
+			actual := c.Modules["mod"].Rules[last].Body
+			if !actual.Equal(tc.exp) {
+				t.Errorf("Expected reordered body to be equal to:\n%v\nBut got:\n%v", tc.exp, actual)
+			}
+		})
 	}
 }
 
@@ -765,7 +832,7 @@ func TestCompilerCheckSafetyBodyErrors(t *testing.T) {
 		{"array-compr-mixed", `p { _ = [x | y = [a | a = z[i]]] }`, `{a, x, z, i}`},
 		{"array-compr-builtin", `p { [true | eq != 2] }`, `{eq,}`},
 		{"closure-self", `p { x = [x | x = 1] }`, `{x,}`},
-		{"closure-transitive", `p { x = y; x = [y | y = 1] }`, `{y,}`},
+		{"closure-transitive", `p { x = y; x = [y | y = 1] }`, `{x,y}`},
 		{"nested", `p { count(baz[i].attr[bar[dead.beef]], n) }`, `{dead,}`},
 		{"negated-import", `p { not foo; not bar; not baz }`, `set()`},
 		{"rewritten", `p[{"foo": dead[i]}] { true }`, `{dead, i}`},
@@ -778,6 +845,7 @@ func TestCompilerCheckSafetyBodyErrors(t *testing.T) {
 		{"call-too-few", "p { f(1,x) } f(x,y) { true }", "{x,}"},
 		{"object-key-comprehension", "p { { {p|x}: 0 } }", "{x,}"},
 		{"set-value-comprehension", "p { {1, {p|x}} }", "{x,}"},
+		{"every", "p { every y in [10] { x > y } }", "{x,}"},
 	}
 
 	makeErrMsg := func(varName string) string {
@@ -798,15 +866,16 @@ func TestCompilerCheckSafetyBodyErrors(t *testing.T) {
 			sort.Strings(expected)
 
 			// Compile test module.
+			popts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
 			c := NewCompiler()
 			c.Modules = map[string]*Module{
-				"newMod": MustParseModule(fmt.Sprintf(`
+				"newMod": MustParseModuleWithOpts(fmt.Sprintf(`
 
 				%v
 
 				%v
 
-				`, moduleBegin, tc.moduleContent)),
+				`, moduleBegin, tc.moduleContent), popts),
 			}
 
 			compileStages(c, c.checkSafetyRuleBodies)
@@ -861,157 +930,6 @@ func TestCompilerCheckTypes(t *testing.T) {
 	assertNotFailed(t, c)
 }
 
-func TestCompilerCheckTypesWithSchema(t *testing.T) {
-	c := NewCompiler()
-	var schema interface{}
-	err := util.Unmarshal([]byte(objectSchema), &schema)
-	if err != nil {
-		t.Fatal("Unexpected error:", err)
-	}
-	schemaSet := NewSchemaSet()
-	schemaSet.Put(SchemaRootRef, schema)
-	c.WithSchemas(schemaSet)
-	compileStages(c, c.checkTypes)
-	assertNotFailed(t, c)
-}
-
-func TestCompilerCheckTypesWithAllOfSchema(t *testing.T) {
-
-	tests := []struct {
-		note          string
-		schema        string
-		expectedError error
-	}{
-		{
-			note:          "allOf with mergeable Object types in schema",
-			schema:        allOfObjectSchema,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable Array types in schema",
-			schema:        allOfArraySchema,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf without a parent schema",
-			schema:        allOfSchemaParentVariation,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with empty schema",
-			schema:        emptySchema,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable Array of Object types in schema",
-			schema:        allOfArrayOfObjects,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable Object types in schema with type declaration missing",
-			schema:        allOfObjectMissing,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with Array of mergeable different types in schema",
-			schema:        allOfArrayDifTypes,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable Object containing Array types in schema",
-			schema:        allOfArrayInsideObject,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable Array types in schema with type declaration missing",
-			schema:        allOfArrayMissing,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable types inside of core schema",
-			schema:        allOfInsideCoreSchema,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable String types in schema",
-			schema:        allOfStringSchema,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable Integer types in schema",
-			schema:        allOfIntegerSchema,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable Boolean types in schema",
-			schema:        allOfBooleanSchema,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf with mergeable Array types with uneven numbers of items",
-			schema:        allOfSchemaWithUnevenArray,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf schema with unmergeable Array of Arrays",
-			schema:        allOfArrayOfArrays,
-			expectedError: fmt.Errorf("unable to merge these schemas"),
-		},
-		{
-			note:          "allOf schema with Array and Object types as siblings",
-			schema:        allOfObjectAndArray,
-			expectedError: fmt.Errorf("unable to merge these schemas"),
-		},
-		{
-			note:          "allOf schema with Array type that contains different unmergeable types",
-			schema:        allOfArrayDifTypesWithError,
-			expectedError: fmt.Errorf("unable to merge these schemas"),
-		},
-		{
-			note:          "allOf schema with different unmergeable types",
-			schema:        allOfTypeErrorSchema,
-			expectedError: fmt.Errorf("unable to merge these schemas"),
-		},
-		{
-			note:          "allOf unmergeable schema with different parent and items types",
-			schema:        allOfSchemaWithParentError,
-			expectedError: fmt.Errorf("unable to merge these schemas"),
-		},
-		{
-			note:          "allOf schema of Array type with uneven numbers of items to merge",
-			schema:        allOfSchemaWithUnevenArray,
-			expectedError: nil,
-		},
-		{
-			note:          "allOf schema with unmergeable types String and Boolean",
-			schema:        allOfStringSchemaWithError,
-			expectedError: fmt.Errorf("unable to merge these schemas"),
-		},
-	}
-
-	for _, tc := range tests {
-		t.Run(tc.note, func(t *testing.T) {
-			c := NewCompiler()
-			var schema interface{}
-			err := util.Unmarshal([]byte(tc.schema), &schema)
-			if err != nil {
-				t.Fatal("Unexpected error:", err)
-			}
-			schemaSet := NewSchemaSet()
-			schemaSet.Put(SchemaRootRef, schema)
-			c.WithSchemas(schemaSet)
-			compileStages(c, c.checkTypes)
-			if tc.expectedError != nil {
-				if errors.Is(c.Errors, tc.expectedError) {
-					t.Fatal("Unexpected error:", err)
-				}
-			} else {
-				assertNotFailed(t, c)
-			}
-		})
-	}
-}
-
 func TestCompilerCheckRuleConflicts(t *testing.T) {
 
 	c := getCompilerWithParsedModules(map[string]string{
@@ -1045,14 +963,7 @@ g(1,2) { true }`,
 p { true }`,
 		"mod6.rego": `package badrules.existserr
 
-p { true }`,
-		"mod7.rego": `package badrules.redeclaration
-
-p1 := 1
-p1 := 2
-
-p2 = 1
-p2 := 2`})
+p { true }`})
 
 	c.WithPathConflictsCheck(func(path []string) (bool, error) {
 		if reflect.DeepEqual(path, []string{"badrules", "dataoverlap", "p"}) {
@@ -1075,8 +986,6 @@ p2 := 2`})
 		"rego_type_error: multiple default rules named foo found",
 		"rego_type_error: package badrules.r conflicts with rule defined at mod1.rego:7",
 		"rego_type_error: package badrules.r conflicts with rule defined at mod1.rego:8",
-		"rego_type_error: rule named p1 redeclared at mod7.rego:4",
-		"rego_type_error: rule named p2 redeclared at mod7.rego:7",
 	}
 
 	assertCompilerErrorStrings(t, c, expected)
@@ -1095,8 +1004,30 @@ func TestCompilerCheckUndefinedFuncs(t *testing.T) {
 			deadbeef(x)
 		}
 
+		# NOTE: all the dynamic dispatch examples here are not supported,
+		#       we're checking assertions about the error returned.
 		undefined_dynamic_dispatch {
-			x = "f"; data.test2[x](1)  # not currently supported
+			x = "f"; data.test2[x](1)
+		}
+
+		undefined_dynamic_dispatch_declared_var {
+			y := "f"; data.test2[y](1)
+		}
+
+		undefined_dynamic_dispatch_declared_var_in_array {
+			z := "f"; data.test2[[z]](1)
+		}
+
+		arity_mismatch_1 {
+			data.test2.f(1,2,3)
+		}
+
+		arity_mismatch_2 {
+			data.test2.f()
+		}
+
+		arity_mismatch_3 {
+			x:= data.test2.f()
 		}
 	`
 
@@ -1119,12 +1050,38 @@ func TestCompilerCheckUndefinedFuncs(t *testing.T) {
 		"rego_type_error: undefined function data.deadbeef",
 		"rego_type_error: undefined function deadbeef",
 		"rego_type_error: undefined function data.test2[x]",
+		"rego_type_error: undefined function data.test2[y]",
+		"rego_type_error: undefined function data.test2[[z]]",
+		"rego_type_error: function data.test2.f has arity 1, got 3 arguments",
+		"test.rego:31: rego_type_error: function data.test2.f has arity 1, got 0 arguments",
+		"test.rego:35: rego_type_error: function data.test2.f has arity 1, got 0 arguments",
 	}
-
 	for _, w := range want {
 		if !strings.Contains(result, w) {
 			t.Fatalf("Expected %q in result but got: %v", w, result)
 		}
+	}
+}
+
+func TestCompilerQueryCompilerCheckUndefinedFuncs(t *testing.T) {
+	compiler := NewCompiler()
+
+	for _, tc := range []struct {
+		note, query, err string
+	}{
+
+		{note: "undefined function", query: `data.foo(1)`, err: "undefined function data.foo"},
+		{note: "undefined global function", query: `foo(1)`, err: "undefined function foo"},
+		{note: "var", query: `x = "f"; data[x](1)`, err: "undefined function data[x]"},
+		{note: "declared var", query: `x := "f"; data[x](1)`, err: "undefined function data[x]"},
+		{note: "declared var in array", query: `x := "f"; data[[x]](1)`, err: "undefined function data[[x]]"},
+	} {
+		t.Run(tc.note, func(t *testing.T) {
+			_, err := compiler.QueryCompiler().Compile(MustParseBody(tc.query))
+			if !strings.Contains(err.Error(), tc.err) {
+				t.Errorf("Unexpected compilation error: %v (want  %s)", err, tc.err)
+			}
+		})
 	}
 }
 
@@ -1223,9 +1180,9 @@ func TestCompilerExprExpansion(t *testing.T) {
 			note:  "sets",
 			input: `{f(x), {g(x)}}`,
 			expected: []*Expr{
-				MustParseExpr("f(x, __local0__)"),
-				MustParseExpr("g(x, __local1__)"),
-				MustParseExpr("{__local0__, {__local1__,}}"),
+				MustParseExpr("g(x, __local0__)"),
+				MustParseExpr("f(x, __local1__)"),
+				MustParseExpr("{__local1__, {__local0__,}}"),
 			},
 		},
 		{
@@ -1376,13 +1333,26 @@ func TestCompilerRewriteExprTerms(t *testing.T) {
 
 				f(__local0__[0]) { true; __local0__ = [1] }`,
 		},
+		{
+			note: "every: domain",
+			module: `
+			package test
+
+			p { every x in [1,2] { x } }`,
+			expected: `
+			package test
+
+			p { __local2__ = [1, 2]; every __local0__, __local1__ in __local2__ { __local1__ } }`,
+		},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.note, func(t *testing.T) {
 			compiler := NewCompiler()
+			opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
+
 			compiler.Modules = map[string]*Module{
-				"test": MustParseModule(tc.module),
+				"test": MustParseModuleWithOpts(tc.module, opts),
 			}
 			compileStages(compiler, compiler.rewriteExprTerms)
 
@@ -1390,36 +1360,635 @@ func TestCompilerRewriteExprTerms(t *testing.T) {
 			case string:
 				assertNotFailed(t, compiler)
 
-				expected := MustParseModule(exp)
+				expected := MustParseModuleWithOpts(exp, opts)
 
 				if !expected.Equal(compiler.Modules["test"]) {
 					t.Fatalf("Expected modules to be equal. Expected:\n\n%v\n\nGot:\n\n%v", expected, compiler.Modules["test"])
 				}
 			case Errors:
-				if len(exp) != len(compiler.Errors) {
-					t.Fatalf("Expected %d errors, got %d:\n\n%s\n", len(exp), len(compiler.Errors), compiler.Errors.Error())
-				}
-				incorrectErrs := false
-				for _, e := range exp {
-					found := false
-					for _, actual := range compiler.Errors {
-						if e.Message == actual.Message {
-							found = true
-							break
-						}
-					}
-					if !found {
-						incorrectErrs = true
-					}
-				}
-				if incorrectErrs {
-					t.Fatalf("Expected errors:\n\n%s\n\nGot:\n\n%s\n", exp.Error(), compiler.Errors.Error())
-				}
+				assertErrors(t, compiler.Errors, exp, false)
 			default:
 				t.Fatalf("Unsupported value type for test case 'expected' field: %v", exp)
 			}
 
 		})
+	}
+}
+
+func TestIllegalFunctionCallRewrite(t *testing.T) {
+	cases := []struct {
+		note           string
+		module         string
+		expectedErrors []string
+	}{
+		/*{
+					note: "function call override in function value",
+					module: `package test
+		foo(x) := x
+
+		p := foo(bar) {
+			#foo := 1
+			bar := 2
+		}`,
+					expectedErrors: []string{
+						"undefined function foo",
+					},
+				},*/
+		{
+			note: "function call override in array comprehension value",
+			module: `package test
+p := [foo(bar) | foo := 1; bar := 2]`,
+			expectedErrors: []string{
+				"called function foo shadowed",
+			},
+		},
+		{
+			note: "function call override in set comprehension value",
+			module: `package test
+p := {foo(bar) | foo := 1; bar := 2}`,
+			expectedErrors: []string{
+				"called function foo shadowed",
+			},
+		},
+		{
+			note: "function call override in object comprehension value",
+			module: `package test
+p := {foo(bar): bar(foo) | foo := 1; bar := 2}`,
+			expectedErrors: []string{
+				"called function bar shadowed",
+				"called function foo shadowed",
+			},
+		},
+		{
+			note: "function call override in array comprehension value",
+			module: `package test
+p := [foo.bar(baz) | foo := 1; bar := 2; baz := 3]`,
+			expectedErrors: []string{
+				"called function foo.bar shadowed",
+			},
+		},
+		{
+			note: "nested function call override in array comprehension value",
+			module: `package test
+p := [baz(foo(bar)) | foo := 1; bar := 2]`,
+			expectedErrors: []string{
+				"called function foo shadowed",
+			},
+		},
+		{
+			note: "function call override of 'input' root document",
+			module: `package test
+p := [input() | input := 1]`,
+			expectedErrors: []string{
+				"called function input shadowed",
+			},
+		},
+		{
+			note: "function call override of 'data' root document",
+			module: `package test
+p := [data() | data := 1]`,
+			expectedErrors: []string{
+				"called function data shadowed",
+			},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			compiler := NewCompiler()
+			opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
+
+			compiler.Modules = map[string]*Module{
+				"test": MustParseModuleWithOpts(tc.module, opts),
+			}
+			compileStages(compiler, compiler.rewriteLocalVars)
+
+			result := make([]string, 0, len(compiler.Errors))
+			for i := range compiler.Errors {
+				result = append(result, compiler.Errors[i].Message)
+			}
+
+			sort.Strings(tc.expectedErrors)
+			sort.Strings(result)
+
+			if len(tc.expectedErrors) != len(result) {
+				t.Fatalf("Expected %d errors but got %d:\n\n%v\n\nGot:\n\n%v",
+					len(tc.expectedErrors), len(result),
+					strings.Join(tc.expectedErrors, "\n"), strings.Join(result, "\n"))
+			}
+
+			for i := range result {
+				if result[i] != tc.expectedErrors[i] {
+					t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v",
+						strings.Join(tc.expectedErrors, "\n"), strings.Join(result, "\n"))
+				}
+			}
+		})
+	}
+}
+
+func TestCompilerCheckUnusedImports(t *testing.T) {
+	cases := []strictnessTestCase{
+		{
+			note: "simple unused: input ref with same name",
+			module: `package p
+			import data.foo.bar as bar
+			r {
+				input.bar == 11
+			}
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 2, 4),
+					Message:  "import data.foo.bar as bar unused",
+				},
+			},
+		},
+		{
+			note: "unused import, but imported ref used",
+			module: `package p
+			import data.foo # unused
+			r { data.foo == 10 }
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 2, 4),
+					Message:  "import data.foo unused",
+				},
+			},
+		},
+		{
+			note: "one of two unused",
+			module: `package p
+			import data.foo
+			import data.x.power #unused
+			r { foo == 10 }
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 3, 4),
+					Message:  "import data.x.power unused",
+				},
+			},
+		},
+		{
+			note: "multiple unused: with input ref of same name",
+			module: `package p
+			import data.foo
+			import data.x.power
+			r { input.foo == 10 }
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 2, 4),
+					Message:  "import data.foo unused",
+				},
+				&Error{
+					Location: NewLocation([]byte("import"), "", 3, 4),
+					Message:  "import data.x.power unused",
+				},
+			},
+		},
+		{
+			note: "import used in comparison",
+			module: `package p
+			import data.foo.x
+			r { x == 10 }
+			`,
+		},
+		{
+			note: "multiple used imports in one rule",
+			module: `package p
+			import data.foo.x
+			import data.power.ranger
+			r { ranger == x }
+			`,
+		},
+		{
+			note: "multiple used imports in separate rules",
+			module: `package p
+			import data.foo.x
+			import data.power.ranger
+			r { ranger == 23 }
+			t { x == 1 }
+			`,
+		},
+		{
+			note: "import used as function operand",
+			module: `package p
+			import data.foo
+			r = count(foo) > 1 # only one operand
+			`,
+		},
+		{
+			note: "import used as function operand, compount term",
+			module: `package p
+			import data.foo
+			r = sprintf("%v %d", [foo, 0])
+			`,
+		},
+		{
+			note: "import used as plain term",
+			module: `package p
+			import data.foo
+			r {
+				foo
+			}
+			`,
+		},
+		{
+			note: "import used in 'every' domain",
+			module: `package p
+			import future.keywords.every
+			import data.foo
+			r {
+				every x in foo { x > 1 }
+			}
+			`,
+		},
+		{
+			note: "import used in 'every' body",
+			module: `package p
+			import future.keywords.every
+			import data.foo
+			r {
+				every x in [1,2,3] { x > foo }
+			}
+			`,
+		},
+		{
+			note: "future import kept even if unused",
+			module: `package p
+			import future.keywords
+
+			r { true }
+			`,
+		},
+		{
+			note: "shadowed var name in function arg",
+			module: `package p
+			import data.foo # unused
+
+			r { f(1) }
+			f(foo) = foo == 1
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 2, 4),
+					Message:  "import data.foo unused",
+				},
+			},
+		},
+		{
+			note: "shadowed assigned var name",
+			module: `package p
+			import data.foo # unused
+
+			r { foo := true; foo }
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 2, 4),
+					Message:  "import data.foo unused",
+				},
+			},
+		},
+		{
+			note: "used as rule value",
+			module: `package p
+			import data.bar # unused
+			import data.foo
+
+			r = foo { true }
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 2, 4),
+					Message:  "import data.bar unused",
+				},
+			},
+		},
+		{
+			note: "unused as rule value (but same data ref)",
+			module: `package p
+			import data.bar # unused
+			import data.foo # unused
+
+			r = data.foo { true }
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 2, 4),
+					Message:  "import data.bar unused",
+				},
+				&Error{
+					Location: NewLocation([]byte("import"), "", 3, 4),
+					Message:  "import data.foo unused",
+				},
+			},
+		},
+	}
+
+	runStrictnessTestCase(t, cases, true)
+}
+
+func TestCompilerCheckDuplicateImports(t *testing.T) {
+	cases := []strictnessTestCase{
+		{
+			note: "shadow",
+			module: `package test
+				import input.noconflict
+				import input.foo
+				import data.foo
+				import data.bar.foo
+
+				p := noconflict
+				q := foo
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 4, 5),
+					Message:  "import must not shadow import input.foo",
+				},
+				&Error{
+					Location: NewLocation([]byte("import"), "", 5, 5),
+					Message:  "import must not shadow import input.foo",
+				},
+			},
+		}, {
+			note: "alias shadow",
+			module: `package test
+				import input.noconflict
+				import input.foo
+				import input.bar as foo
+
+				p := noconflict
+				q := foo
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("import"), "", 4, 5),
+					Message:  "import must not shadow import input.foo",
+				},
+			},
+		},
+	}
+
+	runStrictnessTestCase(t, cases, true)
+}
+
+func TestCompilerCheckKeywordOverrides(t *testing.T) {
+	cases := []strictnessTestCase{
+		{
+			note: "rule names",
+			module: `package test
+				input { true }
+				p { true }
+				data { true }
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("input { true }"), "", 2, 5),
+					Message:  "rules must not shadow input (use a different rule name)",
+				},
+				&Error{
+					Location: NewLocation([]byte("data { true }"), "", 4, 5),
+					Message:  "rules must not shadow data (use a different rule name)",
+				},
+			},
+		},
+		{
+			note: "global assignments",
+			module: `package test
+				input = 1
+				p := 2
+				data := 3
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("input = 1"), "", 2, 5),
+					Message:  "rules must not shadow input (use a different rule name)",
+				},
+				&Error{
+					Location: NewLocation([]byte("data := 3"), "", 4, 5),
+					Message:  "rules must not shadow data (use a different rule name)",
+				},
+			},
+		},
+		{
+			note: "rule-local assignments",
+			module: `package test
+				p {
+					input := 1
+					x := 2
+				} else {
+					data := 3
+				}
+				q {
+					input := 4
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("input := 1"), "", 3, 6),
+					Message:  "variables must not shadow input (use a different variable name)",
+				},
+				&Error{
+					Location: NewLocation([]byte("data := 3"), "", 6, 6),
+					Message:  "variables must not shadow data (use a different variable name)",
+				},
+				&Error{
+					Location: NewLocation([]byte("input := 4"), "", 9, 6),
+					Message:  "variables must not shadow input (use a different variable name)",
+				},
+			},
+		},
+		{
+			note: "array comprehension-local assignments",
+			module: `package test
+				p = [ x |
+					input := 1
+					x := 2
+					data := 3
+				]
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("input := 1"), "", 3, 6),
+					Message:  "variables must not shadow input (use a different variable name)",
+				},
+				&Error{
+					Location: NewLocation([]byte("data := 3"), "", 5, 6),
+					Message:  "variables must not shadow data (use a different variable name)",
+				},
+			},
+		},
+		{
+			note: "set comprehension-local assignments",
+			module: `package test
+				p = { x |
+					input := 1
+					x := 2
+					data := 3
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("input := 1"), "", 3, 6),
+					Message:  "variables must not shadow input (use a different variable name)",
+				},
+				&Error{
+					Location: NewLocation([]byte("data := 3"), "", 5, 6),
+					Message:  "variables must not shadow data (use a different variable name)",
+				},
+			},
+		},
+		{
+			note: "object comprehension-local assignments",
+			module: `package test
+				p = { x: 1 |
+					input := 1
+					x := 2
+					data := 3
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("input := 1"), "", 3, 6),
+					Message:  "variables must not shadow input (use a different variable name)",
+				},
+				&Error{
+					Location: NewLocation([]byte("data := 3"), "", 5, 6),
+					Message:  "variables must not shadow data (use a different variable name)",
+				},
+			},
+		},
+		{
+			note: "nested override",
+			module: `package test
+				p {
+					[ x |
+						input := 1
+						x := 2
+						data := 3
+					]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("input := 1"), "", 4, 7),
+					Message:  "variables must not shadow input (use a different variable name)",
+				},
+				&Error{
+					Location: NewLocation([]byte("data := 3"), "", 6, 7),
+					Message:  "variables must not shadow data (use a different variable name)",
+				},
+			},
+		},
+	}
+
+	runStrictnessTestCase(t, cases, true)
+}
+
+func TestCompilerCheckDeprecatedMethods(t *testing.T) {
+	cases := []strictnessTestCase{
+		{
+			note: "all() built-in",
+			module: `package test
+				p := all([true, false])
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("all([true, false])"), "", 2, 10),
+					Message:  "deprecated built-in function calls in expression: all",
+				},
+			},
+		},
+		{
+			note: "user-defined all()",
+			module: `package test
+				import future.keywords.in
+				all(arr) = {x | some x in arr} == {true}
+				p := all([true, false])
+			`,
+		},
+		{
+			note: "any() built-in",
+			module: `package test
+				p := any([true, false])
+			`,
+			expectedErrors: Errors{
+				&Error{
+					Location: NewLocation([]byte("any([true, false])"), "", 2, 10),
+					Message:  "deprecated built-in function calls in expression: any",
+				},
+			},
+		},
+		{
+			note: "user-defined any()",
+			module: `package test
+				import future.keywords.in
+				any(arr) = true in arr
+				p := any([true, false])
+			`,
+		},
+	}
+
+	runStrictnessTestCase(t, cases, true)
+}
+
+type strictnessTestCase struct {
+	note           string
+	module         string
+	expectedErrors Errors
+}
+
+func runStrictnessTestCase(t *testing.T, cases []strictnessTestCase, assertLocation bool) {
+	t.Helper()
+	makeTestRunner := func(tc strictnessTestCase, strict bool) func(t *testing.T) {
+		return func(t *testing.T) {
+			compiler := NewCompiler().WithStrict(strict)
+			compiler.Modules = map[string]*Module{
+				"test": MustParseModule(tc.module),
+			}
+			compileStages(compiler, nil)
+
+			if strict {
+				assertErrors(t, compiler.Errors, tc.expectedErrors, assertLocation)
+			} else {
+				assertNotFailed(t, compiler)
+			}
+		}
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note+"_strict", makeTestRunner(tc, true))
+		t.Run(tc.note+"_non-strict", makeTestRunner(tc, false))
+	}
+}
+
+func assertErrors(t *testing.T, actual Errors, expected Errors, assertLocation bool) {
+	t.Helper()
+	if len(expected) != len(actual) {
+		t.Fatalf("Expected %d errors, got %d:\n\n%s\n", len(expected), len(actual), actual.Error())
+	}
+	incorrectErrs := false
+	for _, e := range expected {
+		found := false
+		for _, actual := range actual {
+			if e.Message == actual.Message {
+				if !assertLocation || e.Location.Equal(actual.Location) {
+					found = true
+					break
+				}
+			}
+		}
+		if !found {
+			incorrectErrs = true
+		}
+	}
+	if incorrectErrs {
+		t.Fatalf("Expected errors:\n\n%s\n\nGot:\n\n%s\n", expected.Error(), actual.Error())
 	}
 }
 
@@ -1467,6 +2036,24 @@ p[foo[bar[i]]] = {"baz": baz} { true }`)
 			[true | x := y]
 		}`)
 
+	c.Modules["someinassign"] = MustParseModule(`package someinassign
+		import future.keywords.in
+		x = 1
+		y = 1
+
+		p[x] {
+			some x in [1, 2, y]
+		}`)
+
+	c.Modules["someinassignwithkey"] = MustParseModule(`package someinassignwithkey
+		import future.keywords.in
+		x = 1
+		y = 1
+
+		p[x] {
+			some k, v in [1, 2, y]
+		}`)
+
 	c.Modules["donotresolve"] = MustParseModule(`package donotresolve
 
 		x = 1
@@ -1499,6 +2086,19 @@ p[foo[bar[i]]] = {"baz": baz} { true }`)
 
 		r = [y | y = f(1)[0]]
 		`)
+
+	c.Modules["everykw"] = MustParseModuleWithOpts(`package everykw
+
+	nums = {1, 2, 3}
+	f(_) = true
+	x = 100
+	xs = [1, 2, 3]
+	p {
+		every x in xs {
+			nums[x]
+			x > 10
+		}
+	}`, ParserOptions{unreleasedKeywords: true, FutureKeywords: []string{"every", "in"}})
 
 	compileStages(c, c.resolveAllRefs)
 	assertNotFailed(t, c)
@@ -1611,6 +2211,32 @@ p[foo[bar[i]]] = {"baz": baz} { true }`)
 	mod13 := c.Modules["comprehensions"]
 	assertExprEqual(t, mod13.Rules[3].Body[0].Terms.(*Term).Value.(Ref)[3].Value.(*ArrayComprehension).Body[0], MustParseExpr("x = data.comprehensions.nums[_]"))
 	assertExprEqual(t, mod13.Rules[4].Head.Value.Value.(*ArrayComprehension).Body[0], MustParseExpr("y = data.comprehensions.f(1)[0]"))
+
+	// Ignore vars assigned via `some x in xs`.
+	mod14 := c.Modules["someinassign"]
+	someInAssignCall := mod14.Rules[2].Body[0].Terms.(*SomeDecl).Symbols[0].Value.(Call)
+	assertTermEqual(t, someInAssignCall[1], VarTerm("x"))
+	collectionLastElem := someInAssignCall[2].Value.(*Array).Get(IntNumberTerm(2))
+	assertTermEqual(t, collectionLastElem, MustParseTerm("data.someinassign.y"))
+
+	// Ignore key and val vars assigned via `some k, v in xs`.
+	mod15 := c.Modules["someinassignwithkey"]
+	someInAssignCall = mod15.Rules[2].Body[0].Terms.(*SomeDecl).Symbols[0].Value.(Call)
+	assertTermEqual(t, someInAssignCall[1], VarTerm("k"))
+	assertTermEqual(t, someInAssignCall[2], VarTerm("v"))
+	collectionLastElem = someInAssignCall[3].Value.(*Array).Get(IntNumberTerm(2))
+	assertTermEqual(t, collectionLastElem, MustParseTerm("data.someinassignwithkey.y"))
+
+	mod16 := c.Modules["everykw"]
+	everyExpr := mod16.Rules[len(mod16.Rules)-1].Body[0].Terms.(*Every)
+	assertTermEqual(t, everyExpr.Body[0].Terms.(*Term), MustParseTerm("data.everykw.nums[x]"))
+	assertTermEqual(t, everyExpr.Domain, MustParseTerm("data.everykw.xs"))
+
+	// 'x' is not resolved
+	assertTermEqual(t, everyExpr.Value, VarTerm("x"))
+	gt10 := MustParseExpr("x > 10")
+	gt10.Index++ // TODO(sr): why?
+	assertExprEqual(t, everyExpr.Body[1], gt10)
 }
 
 func TestCompilerResolveErrors(t *testing.T) {
@@ -1676,6 +2302,274 @@ elsekw {
 	rule5 := c.Modules["head"].Rules[4]
 	expected5 := MustParseRule(`elsekw { false } else = __local5__ { true; __local5__ = input.qux }`)
 	assertRulesEqual(t, rule5, expected5)
+}
+
+func TestCompilerRewriteRegoMetadataCalls(t *testing.T) {
+	tests := []struct {
+		note   string
+		module string
+		exp    string
+	}{
+		{
+			note: "rego.metadata called, no metadata",
+			module: `package test
+
+p {
+	rego.metadata.chain()[0].path == ["test", "p"]
+	rego.metadata.rule() == {}
+}`,
+			exp: `package test
+
+p = true {
+	__local2__ = [{"path": ["test", "p"]}]
+	__local3__ = {}
+	__local0__ = __local2__
+	equal(__local0__[0].path, ["test", "p"])
+	__local1__ = __local3__
+	equal(__local1__, {})
+}`,
+		},
+		{
+			note: "rego.metadata called, no output var, no metadata",
+			module: `package test
+
+p {
+	rego.metadata.chain()
+	rego.metadata.rule()
+}`,
+			exp: `package test
+
+p = true {
+	__local0__ = [{"path": ["test", "p"]}]
+	__local1__ = {}
+	__local0__
+	__local1__
+}`,
+		},
+		{
+			note: "rego.metadata called, with metadata",
+			module: `# METADATA
+# description: A test package
+package test
+
+# METADATA
+# title: My P Rule
+p {
+	rego.metadata.chain()[0].title == "My P Rule"
+	rego.metadata.chain()[1].description == "A test package"
+}
+
+# METADATA
+# title: My Other P Rule
+p {
+	rego.metadata.rule().title == "My Other P Rule"
+}`,
+			exp: `# METADATA
+# {"scope":"package","description":"A test package"}
+package test
+
+# METADATA
+# {"scope":"rule","title":"My P Rule"}
+p = true {
+	__local3__ = [
+		{"annotations": {"scope": "rule", "title": "My P Rule"}, "path": ["test", "p"]},
+		{"annotations": {"description": "A test package", "scope": "package"}, "path": ["test"]}
+	]
+	__local0__ = __local3__
+	equal(__local0__[0].title, "My P Rule")
+	__local1__ = __local3__
+	equal(__local1__[1].description, "A test package")
+}
+
+# METADATA
+# {"scope":"rule","title":"My Other P Rule"}
+p = true {
+	__local4__ = {"scope": "rule", "title": "My Other P Rule"}
+	__local2__ = __local4__
+	equal(__local2__.title, "My Other P Rule")
+}`,
+		},
+		{
+			note: "rego.metadata referenced multiple times",
+			module: `# METADATA
+# description: TEST
+package test
+
+p {
+	rego.metadata.chain()[0].path == ["test", "p"]
+	rego.metadata.chain()[1].path == ["test"]
+}`,
+			exp: `# METADATA
+# {"scope":"package","description":"TEST"}
+package test
+
+p = true {
+	__local2__ = [
+		{"path": ["test", "p"]},
+		{"annotations": {"description": "TEST", "scope": "package"}, "path": ["test"]}
+	]
+	__local0__ = __local2__
+	equal(__local0__[0].path, ["test", "p"])
+	__local1__ = __local2__
+	equal(__local1__[1].path, ["test"]) }`,
+		},
+		{
+			note: "rego.metadata return value",
+			module: `package test
+
+p := rego.metadata.chain()`,
+			exp: `package test
+
+p := __local0__ {
+	__local1__ = [{"path": ["test", "p"]}]
+	true
+	__local0__ = __local1__
+}`,
+		},
+		{
+			note: "rego.metadata argument in function call",
+			module: `package test
+
+p {
+	q(rego.metadata.chain())
+}
+
+q(s) {
+	s == ["test", "p"]
+}`,
+			exp: `package test
+
+p = true {
+	__local2__ = [{"path": ["test", "p"]}]
+	__local1__ = __local2__
+	data.test.q(__local1__)
+}
+
+q(__local0__) = true {
+	equal(__local0__, ["test", "p"])
+}`,
+		},
+		{
+			note: "rego.metadata used in array comprehension",
+			module: `package test
+
+p = [x | x := rego.metadata.chain()]`,
+			exp: `package test
+
+p = [__local0__ | __local1__ = __local2__; __local0__ = __local1__] {
+	__local2__ = [{"path": ["test", "p"]}]
+	true
+}`,
+		},
+		{
+			note: "rego.metadata used in nested array comprehension",
+			module: `package test
+
+p {
+	y := [x | x := rego.metadata.chain()]
+	y[0].path == ["test", "p"]
+}`,
+			exp: `package test
+
+p = true {
+	__local3__ = [{"path": ["test", "p"]}];
+	__local1__ = [__local0__ | __local2__ = __local3__; __local0__ = __local2__];
+	equal(__local1__[0].path, ["test", "p"])
+}`,
+		},
+		{
+			note: "rego.metadata used in set comprehension",
+			module: `package test
+
+p = {x | x := rego.metadata.chain()}`,
+			exp: `package test
+
+p = {__local0__ | __local1__ = __local2__; __local0__ = __local1__} {
+	__local2__ = [{"path": ["test", "p"]}]
+	true
+}`,
+		},
+		{
+			note: "rego.metadata used in nested set comprehension",
+			module: `package test
+
+p {
+	y := {x | x := rego.metadata.chain()}
+	y[0].path == ["test", "p"]
+}`,
+			exp: `package test
+
+p = true {
+	__local3__ = [{"path": ["test", "p"]}]
+	__local1__ = {__local0__ | __local2__ = __local3__; __local0__ = __local2__}
+	equal(__local1__[0].path, ["test", "p"])
+}`,
+		},
+		{
+			note: "rego.metadata used in object comprehension",
+			module: `package test
+
+p = {i: x | x := rego.metadata.chain()[i]}`,
+			exp: `package test
+
+p = {i: __local0__ | __local1__ = __local2__; __local0__ = __local1__[i]} {
+	__local2__ = [{"path": ["test", "p"]}]
+	true
+}`,
+		},
+		{
+			note: "rego.metadata used in nested object comprehension",
+			module: `package test
+
+p {
+	y := {i: x | x := rego.metadata.chain()[i]}
+	y[0].path == ["test", "p"]
+}`,
+			exp: `package test
+
+p = true {
+	__local3__ = [{"path": ["test", "p"]}]
+	__local1__ = {i: __local0__ | __local2__ = __local3__; __local0__ = __local2__[i]}
+	equal(__local1__[0].path, ["test", "p"])
+}`,
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			c := NewCompiler()
+			c.Modules = map[string]*Module{
+				"test.rego": MustParseModule(tc.module),
+			}
+			compileStages(c, c.rewriteRegoMetadataCalls)
+			assertNotFailed(t, c)
+
+			result := c.Modules["test.rego"]
+			exp := MustParseModuleWithOpts(tc.exp, ParserOptions{ProcessAnnotation: true})
+
+			if result.Compare(exp) != 0 {
+				t.Fatalf("\nExpected:\n\n%v\n\nGot:\n\n%v", exp, result)
+			}
+		})
+	}
+}
+
+func TestCompilerOverridingSelfCalls(t *testing.T) {
+	c := NewCompiler()
+	c.Modules = map[string]*Module{
+		"self.rego": MustParseModule(`package self.metadata
+
+chain(x) = "foo"
+rule := "bar"`),
+		"test.rego": MustParseModule(`package test
+import data.self
+
+p := self.metadata.chain(42)
+q := self.metadata.rule`),
+	}
+
+	compileStages(c, nil)
+	assertNotFailed(t, c)
 }
 
 func TestCompilerRewriteLocalAssignments(t *testing.T) {
@@ -2252,7 +3146,7 @@ func TestRewriteLocalVarDeclarationErrors(t *testing.T) {
 	}
 }
 
-func TestRewriteDecledVarsStage(t *testing.T) {
+func TestRewriteDeclaredVarsStage(t *testing.T) {
 
 	// Unlike the following test case, this only executes up to the
 	// RewriteLocalVars stage. This is done so that later stages like
@@ -2379,6 +3273,352 @@ func TestRewriteDeclaredVars(t *testing.T) {
 			`,
 		},
 		{
+			note: "rewrite some x in xs",
+			module: `
+				package test
+				import future.keywords.in
+				xs = ["a", "b", "c"]
+				p { some x in xs; x == "a" }
+			`,
+			exp: `
+				package test
+				xs = ["a", "b", "c"]
+				p { __local2__ = data.test.xs[__local1__]; __local2__ = "a" }
+			`,
+		},
+		{
+			note: "rewrite some k, x in xs",
+			module: `
+				package test
+				import future.keywords.in
+				xs = ["a", "b", "c"]
+				p { some k, x in xs; x == "a"; k == 2 }
+			`,
+			exp: `
+				package test
+				xs = ["a", "b", "c"]
+				p { __local1__ = data.test.xs[__local0__]; __local1__ = "a"; __local0__ = 2 }
+			`,
+		},
+		{
+			note: "rewrite some k, x in xs[i]",
+			module: `
+				package test
+				import future.keywords.in
+				xs = [["a", "b", "c"], []]
+				p {
+					some i
+					some k, x in xs[i]
+					x == "a"
+					k == 2
+				}
+			`,
+			exp: `
+				package test
+				xs = [["a", "b", "c"], []]
+				p = true { __local2__ = data.test.xs[__local0__][__local1__]; __local2__ = "a"; __local1__ = 2 }
+			`,
+		},
+		{
+			note: "rewrite some k, x in xs[i] with `i` as ref",
+			module: `
+				package test
+				import future.keywords.in
+				i = 0
+				xs = [["a", "b", "c"], []]
+				p {
+					some k, x in xs[i]
+					x == "a"
+					k == 2
+				}
+			`,
+			exp: `
+				package test
+				i = 0
+				xs = [["a", "b", "c"], []]
+				p = true { __local2__ = data.test.i; __local1__ = data.test.xs[__local2__][__local0__]; __local1__ = "a"; __local0__ = 2 }
+			`,
+		},
+		{
+			note: "rewrite some: with modifier on domain",
+			module: `
+				package test
+				p {
+					some k, x in input with input as [1, 1, 1]
+					k == 0
+					x == 1
+				}
+			`,
+			exp: `
+				package test
+				p {
+					__local1__ = input[__local0__] with input as [1, 1, 1]
+					__local0__ = 0
+					__local1__ = 1
+				}
+			`,
+		},
+		{
+			note: "rewrite every",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				i = 0
+				xs = [1, 2]
+				k = "foo"
+				v = "bar"
+				p {
+					every k, v in xs { k + v > i }
+				}
+			`,
+			exp: `
+				package test
+				i = 0
+				xs = [1, 2]
+				k = "foo"
+				v = "bar"
+				p = true {
+					__local2__ = data.test.xs
+					every __local0__, __local1__ in __local2__ {
+						plus(__local0__, __local1__, __local3__)
+						__local4__ = data.test.i
+						gt(__local3__, __local4__)
+					}
+				}			`,
+		},
+		{
+			note: "rewrite every: unused key var",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					every k, v in [1] { v >= 1 }
+				}
+			`,
+			wantErr: errors.New("declared var k unused"),
+		},
+		{
+			// NOTE(sr): this would happen when compiling modules twice:
+			// the first run rewrites every to include a generated key var,
+			// the second one bails because it's not used.
+			// Seen in the wild when using `opa test -b` on a bundle that
+			// used `every`, https://github.com/open-policy-agent/opa/issues/4420
+			note: "rewrite every: unused generated key var",
+			module: `
+				package test
+
+				p {
+					every __local0__, v in [1] { v >= 1 }
+				}
+			`,
+			exp: `
+				package test
+				p = true {
+					__local3__ = [1]
+					every __local1__, __local2__ in __local3__ { __local2__ >= 1 }
+				}
+		`,
+		},
+		{
+			note: "rewrite every: unused value var",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					every v in [1] { true }
+				}
+			`,
+			wantErr: errors.New("declared var v unused"),
+		},
+		{
+			note: "rewrite every: wildcard value var, used key",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					every k, _ in [1] { k >= 0 }
+				}
+			`,
+			exp: `
+				package test
+				p = true {
+					__local1__ = [1]
+					every __local0__, _ in __local1__ { gte(__local0__, 0) }
+				}
+			`,
+		},
+		{
+			note: "rewrite every: wildcard key+value var", // NOTE(sr): may be silly, but valid
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					every _, _ in [1] { true }
+				}
+			`,
+			exp: `
+				package test
+				p = true { __local0__ = [1]; every _, _ in __local0__ { true } }
+			`,
+		},
+		{
+			note: "rewrite every: declared vars with different scopes",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					some x
+					x = 10
+					every x in [1] { x == 1 }
+				}
+			`,
+			exp: `
+				package test
+				p = true {
+					__local0__ = 10
+					__local3__ = [1]
+					every __local1__, __local2__ in __local3__ { __local2__ = 1 }
+				}
+			`,
+		},
+		{
+			note: "rewrite every: declared vars used in body",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					some y
+					y = 10
+					every x in [1] { x == y }
+				}
+			`,
+			exp: `
+				package test
+				p = true {
+					__local0__ = 10
+					__local3__ = [1]
+					every __local1__, __local2__ in __local3__ {
+						__local2__ = __local0__
+					}
+				}
+			`,
+		},
+		{
+			note: "rewrite every: pops declared var stack",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p[x] {
+					some x
+					x = 10
+					every _ in [1] { true }
+				}
+			`,
+			exp: `
+				package test
+				p[__local0__] { __local0__ = 10; __local2__ = [1]; every __local1__, _ in __local2__ { true } }
+			`,
+		},
+		{
+			note: "rewrite every: nested",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					xs := [[1], [2]]
+					every v in [1] {
+						every w in xs[v] {
+							w == 2
+						}
+					}
+				}
+			`,
+			exp: `
+				package test
+				p = true {
+					__local0__ = [[1], [2]]
+					__local5__ = [1]
+					every __local1__, __local2__ in __local5__ {
+						__local6__ = __local0__[__local2__]
+						every __local3__, __local4__ in __local6__ {
+							__local4__ = 2
+						}
+					}
+				}
+			`,
+		},
+		{
+			note: "rewrite every: with modifier on domain",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					every x in input { x == 1 } with input as [1, 1, 1]
+				}
+			`,
+			exp: `
+				package test
+				p {
+					__local2__ = input with input as [1, 1, 1]
+					every __local0__, __local1__ in __local2__ {
+						__local1__ = 1
+					} with input as [1, 1, 1]
+				}
+			`,
+		},
+		{
+			note: "rewrite every: with modifier on domain with declared var",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					xs := [1, 2]
+					every x in input { x == 1 } with input as xs
+				}
+			`,
+			exp: `
+				package test
+				p {
+					__local0__ = [1, 2]
+					__local3__ = input with input as __local0__
+					every __local1__, __local2__ in __local3__ {
+						__local2__ = 1
+					} with input as __local0__
+				}
+			`,
+		},
+		{
+			note: "rewrite every: with modifier on body",
+			module: `
+				package test
+				# import future.keywords.in
+				# import future.keywords.every
+				p {
+					every x in [2] { x == input } with input as 2
+				}
+			`,
+			exp: `
+				package test
+				p {
+					__local2__ = [2] with input as 2
+					every __local0__, __local1__ in __local2__ {
+						__local1__ = input
+					} with input as 2
+				}
+			`,
+		},
+		{
 			note: "rewrite closures",
 			module: `
 				package test
@@ -2446,7 +3686,7 @@ func TestRewriteDeclaredVars(t *testing.T) {
 					data.test.f(__local2__, "bar")
 				}
 
-				 f(__local0__, __local1__) = true {
+				f(__local0__, __local1__) = true {
 					__local0__[__local1__]
 				}
 			`,
@@ -2521,7 +3761,8 @@ func TestRewriteDeclaredVars(t *testing.T) {
 
 	for _, tc := range tests {
 		t.Run(tc.note, func(t *testing.T) {
-			compiler, err := CompileModules(map[string]string{"test.rego": tc.module})
+			opts := CompileOpts{ParserOptions: ParserOptions{FutureKeywords: []string{"in", "every"}, unreleasedKeywords: true}}
+			compiler, err := CompileModulesWithOpt(map[string]string{"test.rego": tc.module}, opts)
 			if tc.wantErr != nil {
 				if err == nil {
 					t.Fatal("Expected error but got success")
@@ -2532,7 +3773,7 @@ func TestRewriteDeclaredVars(t *testing.T) {
 			} else if err != nil {
 				t.Fatal(err)
 			} else {
-				exp := MustParseModule(tc.exp)
+				exp := MustParseModuleWithOpts(tc.exp, opts.ParserOptions)
 				result := compiler.Modules["test.rego"]
 				if exp.Compare(result) != 0 {
 					t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp, result)
@@ -2550,9 +3791,8 @@ func TestCompileInvalidEqAssignExpr(t *testing.T) {
 
 
 	p {
-		# Type checking runs at a later stage so these errors will not be #
-		# caught until then. The stages before type checking should be tolerant
-		# of invalid eq and assign calls.
+		# Arity mismatches are caught in the checkUndefinedFuncs check,
+		# and invalid eq/assign calls are passed along until then.
 		assign()
 		assign(1)
 		eq()
@@ -2560,10 +3800,10 @@ func TestCompileInvalidEqAssignExpr(t *testing.T) {
 	}`)
 
 	var prev func()
-	checkRecursion := reflect.ValueOf(c.checkRecursion)
+	checkUndefinedFuncs := reflect.ValueOf(c.checkUndefinedFuncs)
 
 	for _, stage := range c.stages {
-		if reflect.ValueOf(stage.f).Pointer() == checkRecursion.Pointer() {
+		if reflect.ValueOf(stage.f).Pointer() == checkUndefinedFuncs.Pointer() {
 			break
 		}
 		prev = stage.f
@@ -2697,16 +3937,21 @@ func TestCompilerRewriteDynamicTerms(t *testing.T) {
 		{`call_with { count(str) with input as 1 }`, `__local0__ = data.test.str with input as 1; count(__local0__) with input as 1`},
 		{`call_func { f(input, "foo") } f(x,y) { x[y] }`, `__local2__ = input; data.test.f(__local2__, "foo")`},
 		{`call_func2 { f(input.foo, "foo") } f(x,y) { x[y] }`, `__local2__ = input.foo; data.test.f(__local2__, "foo")`},
+		{`every_domain { every _ in str { true } }`, `__local1__ = data.test.str; every __local0__, _ in __local1__ { true }`},
+		{`every_domain_call { every _ in numbers.range(1, 10) { true } }`, `numbers.range(1, 10, __local1__); every __local0__, _ in __local1__ { true }`},
+		{`every_body { every _ in [] { [str] } }`,
+			`__local1__ = []; every __local0__, _ in __local1__ { __local2__ = data.test.str; [__local2__] }`},
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
 			c := NewCompiler()
+			opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
 			module := fixture + tc.input
-			c.Modules["test"] = MustParseModule(module)
+			c.Modules["test"] = MustParseModuleWithOpts(module, opts)
 			compileStages(c, c.rewriteDynamicTerms)
 			assertNotFailed(t, c)
-			expected := MustParseBody(tc.expected)
+			expected := MustParseBodyWithOpts(tc.expected, opts)
 			result := c.Modules["test"].Rules[1].Body
 			if result.Compare(expected) != 0 {
 				t.Fatalf("\nExp: %v\nGot: %v", expected, result)
@@ -2723,10 +3968,11 @@ func TestCompilerRewriteWithValue(t *testing.T) {
 	`
 
 	tests := []struct {
-		note     string
-		input    string
-		expected string
-		wantErr  error
+		note         string
+		input        string
+		expected     string
+		expectedRule *Rule
+		wantErr      error
 	}{
 		{
 			note:     "nop",
@@ -2766,7 +4012,80 @@ func TestCompilerRewriteWithValue(t *testing.T) {
 		{
 			note:    "invalid target",
 			input:   `p { true with foo.q as 1 }`,
-			wantErr: fmt.Errorf("rego_type_error: with keyword target must start with input or data"),
+			wantErr: fmt.Errorf("rego_type_error: with keyword target must reference existing input, data, or a function"),
+		},
+		{
+			note:     "built-in function: replaced by (unknown) var",
+			input:    `p { true with time.now_ns as foo }`,
+			expected: `p { true with time.now_ns as foo }`, // `foo` still a Var here
+		},
+		{
+			note: "built-in function: valid, arity 0",
+			input: `
+				p { true with time.now_ns as now }
+				now() = 1
+			`,
+			expected: `p { true with time.now_ns as data.test.now }`,
+		},
+		{
+			note: "built-in function: valid func ref, arity 1",
+			input: `
+				p { true with http.send as mock_http_send }
+				mock_http_send(_) = { "body": "yay" }
+			`,
+			expected: `p { true with http.send as data.test.mock_http_send }`,
+		},
+		{
+			note: "built-in function: replaced by value",
+			input: `
+				p { true with http.send as { "body": "yay" } }
+			`,
+			expected: `p { true with http.send as {"body": "yay"} }`,
+		},
+		{
+			note: "built-in function: replaced by comprehension",
+			input: `
+				p { true with http.send as { x: true | x := ["a", "b"][_] } }
+			`,
+			expected: `p { __local2__ = {__local0__: true | __local1__ = ["a", "b"]; __local0__ = __local1__[_]}; true with http.send as __local2__ }`,
+		},
+		{
+			note: "built-in function: replaced by ref",
+			input: `
+				p { true with http.send as resp }
+				resp := { "body": "yay" }
+			`,
+			expected: `p { true with http.send as data.test.resp }`,
+		},
+		{
+			note: "built-in function: replaced by another built-in (ref)",
+			input: `
+				p { true with http.send as object.union_n }
+			`,
+			expected: `p { true with http.send as object.union_n }`,
+		},
+		{
+			note: "built-in function: replaced by another built-in (simple)",
+			input: `
+				p { true with http.send as count }
+			`,
+			expectedRule: func() *Rule {
+				r := MustParseRule(`p { true with http.send as count }`)
+				r.Body[0].With[0].Value.Value = Ref([]*Term{VarTerm("count")})
+				return r
+			}(),
+		},
+		{
+			note: "built-in function: valid, arity 1, non-compound name",
+			input: `
+				p { concat("/", input) with concat as mock_concat }
+				mock_concat(_, _) = "foo/bar"
+			`,
+			expectedRule: func() *Rule {
+				r := MustParseRule(`p { concat("/", input) with concat as data.test.mock_concat }`)
+				r.Body[0].With[0].Target.Value = Ref([]*Term{VarTerm("concat")})
+				return r
+			}(),
 		},
 	}
 
@@ -2778,7 +4097,10 @@ func TestCompilerRewriteWithValue(t *testing.T) {
 			compileStages(c, c.rewriteWithModifiers)
 			if tc.wantErr == nil {
 				assertNotFailed(t, c)
-				expected := MustParseRule(tc.expected)
+				expected := tc.expectedRule
+				if expected == nil {
+					expected = MustParseRule(tc.expected)
+				}
 				result := c.Modules["test"].Rules[1]
 				if result.Compare(expected) != 0 {
 					t.Fatalf("\nExp: %v\nGot: %v", expected, result)
@@ -2790,19 +4112,577 @@ func TestCompilerRewriteWithValue(t *testing.T) {
 	}
 }
 
-func TestCompilerMockFunction(t *testing.T) {
-	c := NewCompiler()
-	c.Modules["test"] = MustParseModule(`
-	package test
+func TestCompilerRewritePrintCallsErasure(t *testing.T) {
 
-	is_allowed(label) {
-	    label == "test_label"
+	cases := []struct {
+		note   string
+		module string
+		exp    string
+	}{
+		{
+			note: "no-op",
+			module: `package test
+			p { true }`,
+			exp: `package test
+			p { true }`,
+		},
+		{
+			note: "replace empty body with true",
+			module: `package test
+
+			p { print(1) }
+			`,
+			exp: `package test
+
+			p { true } `,
+		},
+		{
+			note: "rule body",
+			module: `package test
+
+			p { false; print(1) }
+			`,
+			exp: `package test
+
+			p { false } `,
+		},
+		{
+			note: "set comprehension body",
+			module: `package test
+
+			p { {1 | false; print(1)} }
+			`,
+			exp: `package test
+
+			p { {1 | false} } `,
+		},
+		{
+			note: "array comprehension body",
+			module: `package test
+
+			p { [1 | false; print(1)] }
+			`,
+			exp: `package test
+
+			p { [1 | false] } `,
+		},
+		{
+			note: "object comprehension body",
+			module: `package test
+
+			p { {"x": 1 | false; print(1)} }
+			`,
+			exp: `package test
+
+			p { {"x": 1 | false} } `,
+		},
+		{
+			note: "every body",
+			module: `package test
+
+			p { every _ in [] { false; print(1) } }
+			`,
+			exp: `package test
+
+			p = true { __local1__ = []; every __local0__, _ in __local1__ { false } }`,
+		},
+		{
+			note: "in head",
+			module: `package test
+
+			p = {1 | print("x")}`,
+			exp: `package test
+
+			p = __local0__ { true; __local0__ = {1 | true} }`,
+		},
 	}
 
-	p {true with data.test.is_allowed as "blah" }
-	`)
-	compileStages(c, c.rewriteWithModifiers)
-	assertCompilerErrorStrings(t, c, []string{"rego_compile_error: with keyword cannot replace functions"})
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			c := NewCompiler().WithEnablePrintStatements(false)
+			opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
+			c.Compile(map[string]*Module{
+				"test.rego": MustParseModuleWithOpts(tc.module, opts),
+			})
+			if c.Failed() {
+				t.Fatal(c.Errors)
+			}
+			exp := MustParseModuleWithOpts(tc.exp, opts)
+			if !exp.Equal(c.Modules["test.rego"]) {
+				t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp, c.Modules["test.rego"])
+			}
+		})
+	}
+}
+
+func TestCompilerRewritePrintCallsErrors(t *testing.T) {
+	cases := []struct {
+		note   string
+		module string
+		exp    error
+	}{
+		{
+			note: "non-existent var",
+			module: `package test
+
+			p { print(x) }`,
+			exp: errors.New("var x is undeclared"),
+		},
+		{
+			note: "declared after print",
+			module: `package test
+
+			p { print(x); x = 7 }`,
+			exp: errors.New("var x is undeclared"),
+		},
+		{
+			note: "inside comprehension",
+			module: `package test
+			p { {1 | print(x)} }
+			`,
+			exp: errors.New("var x is undeclared"),
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			c := NewCompiler().WithEnablePrintStatements(true)
+			c.Compile(map[string]*Module{
+				"test.rego": MustParseModule(tc.module),
+			})
+			if !c.Failed() {
+				t.Fatal("expected error")
+			}
+			if c.Errors[0].Code != CompileErr || c.Errors[0].Message != tc.exp.Error() {
+				t.Fatal("unexpected error:", c.Errors)
+			}
+		})
+	}
+}
+
+func TestCompilerRewritePrintCalls(t *testing.T) {
+	cases := []struct {
+		note   string
+		module string
+		exp    string
+	}{
+		{
+			note: "print one",
+			module: `package test
+
+			p { print(1) }`,
+			exp: `package test
+
+			p = true { __local1__ = {__local0__ | __local0__ = 1}; internal.print([__local1__]) }`,
+		},
+		{
+			note: "print multiple",
+			module: `package test
+
+			p { print(1, 2) }`,
+			exp: `package test
+
+			p = true { __local2__ = {__local0__ | __local0__ = 1}; __local3__ = {__local1__ | __local1__ = 2}; internal.print([__local2__, __local3__]) }`,
+		},
+		{
+			note: "print inside set comprehension",
+			module: `package test
+
+			p { x = 1; {2 | print(x)} }`,
+			exp: `package test
+
+			p = true { x = 1; {2 | __local1__ = {__local0__ | __local0__ = x}; internal.print([__local1__])} }`,
+		},
+		{
+			note: "print inside array comprehension",
+			module: `package test
+
+			p { x = 1; [2 | print(x)] }`,
+			exp: `package test
+
+			p = true { x = 1; [2 | __local1__ = {__local0__ | __local0__ = x}; internal.print([__local1__])] }`,
+		},
+		{
+			note: "print inside object comprehension",
+			module: `package test
+
+			p { x = 1; {"x": 2 | print(x)} }`,
+			exp: `package test
+
+			p = true { x = 1; {"x": 2 | __local1__ = {__local0__ | __local0__ = x}; internal.print([__local1__])} }`,
+		},
+		{
+			note: "print inside every",
+			module: `package test
+
+			p { every x in [1,2] { print(x) } }`,
+			exp: `package test
+
+			p = true {
+				__local3__ = [1, 2]
+				every __local0__, __local1__ in __local3__ {
+					__local4__ = {__local2__ | __local2__ = __local1__}
+					internal.print([__local4__])
+				}
+			}`,
+		},
+		{
+			note: "print output of nested call",
+			module: `package test
+
+			p {
+				x := split("abc", "")[y]
+				print(x, y)
+			}`,
+			exp: `package test
+
+			p = true { split("abc", "", __local3__); __local0__ = __local3__[y]; __local4__ = {__local1__ | __local1__ = __local0__}; __local5__ = {__local2__ | __local2__ = y}; internal.print([__local4__, __local5__]) }`,
+		},
+		{
+			note: "print call in head",
+			module: `package test
+
+			p = {1 | print("x") }`,
+			exp: `package test
+
+			p = __local1__ {
+				true
+				__local1__ = {1 | __local2__ = { __local0__ | __local0__ = "x"}; internal.print([__local2__])}
+			}`,
+		},
+		{
+			note: "print call in head - args treated as safe",
+			module: `package test
+
+			f(a) = {1 | a[x]; print(x)}`,
+			exp: `package test
+
+			f(__local0__) = __local2__ { true; __local2__ = {1 | __local0__[x]; __local3__ = {__local1__ | __local1__ = x}; internal.print([__local3__])} }
+			`,
+		},
+		{
+			note: "print call of var in head key",
+			module: `package test
+			f(_) = [1, 2, 3]
+			p[x] { [_, x, _] := f(true); print(x) }`,
+			exp: `package test
+			f(__local0__) = [1, 2, 3] { true }
+			p[__local2__] { data.test.f(true, __local5__); [__local1__, __local2__, __local3__] = __local5__; __local6__ = {__local4__ | __local4__ = __local2__}; internal.print([__local6__]) }
+			`,
+		},
+		{
+			note: "print call of var in head value",
+			module: `package test
+			f(_) = [1, 2, 3]
+			p = x { [_, x, _] := f(true); print(x) }`,
+			exp: `package test
+			f(__local0__) = [1, 2, 3] { true }
+			p = __local2__ { data.test.f(true, __local5__); [__local1__, __local2__, __local3__] = __local5__; __local6__ = {__local4__ | __local4__ = __local2__}; internal.print([__local6__]) }
+			`,
+		},
+		{
+			note: "print call of vars in head key and value",
+			module: `package test
+			f(_) = [1, 2, 3]
+			p[x] = y { [_, x, y] := f(true); print(x) }`,
+			exp: `package test
+			f(__local0__) = [1, 2, 3] { true }
+			p[__local2__] = __local3__ { data.test.f(true, __local5__); [__local1__, __local2__, __local3__] = __local5__; __local6__ = {__local4__ | __local4__ = __local2__}; internal.print([__local6__]) }
+			`,
+		},
+		{
+			note: "print call of vars altered with 'with' and call",
+			module: `package test
+			q = input
+			p {
+				x := q with input as json.unmarshal("{}")
+				print(x)
+			}`,
+			exp: `package test
+			q = __local3__ { true; __local3__ = input }
+			p = true {
+				json.unmarshal("{}", __local2__)
+				__local0__ = data.test.q with input as __local2__
+				__local4__ = {__local1__ | __local1__ = __local0__}
+				internal.print([__local4__])
+			}`,
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note, func(t *testing.T) {
+			c := NewCompiler().WithEnablePrintStatements(true)
+			opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
+			c.Compile(map[string]*Module{
+				"test.rego": MustParseModuleWithOpts(tc.module, opts),
+			})
+			if c.Failed() {
+				t.Fatal(c.Errors)
+			}
+			exp := MustParseModuleWithOpts(tc.exp, opts)
+			if !exp.Equal(c.Modules["test.rego"]) {
+				t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp, c.Modules["test.rego"])
+			}
+		})
+	}
+}
+
+func TestRewritePrintCallsWithElseImplicitArgs(t *testing.T) {
+
+	module := `package test
+
+	f(x, y) {
+		x = y
+	}
+
+	else = false {
+		print(x, y)
+	}`
+
+	c := NewCompiler().WithEnablePrintStatements(true)
+	opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
+	c.Compile(map[string]*Module{
+		"test.rego": MustParseModuleWithOpts(module, opts),
+	})
+
+	if c.Failed() {
+		t.Fatal(c.Errors)
+	}
+
+	exp := MustParseModuleWithOpts(`package test
+
+	f(__local0__, __local1__) = true { __local0__ = __local1__ }
+	else = false { __local6__ = {__local4__ | __local4__ = __local2__}; __local7__ = {__local5__ | __local5__ = __local3__}; internal.print([__local6__, __local7__]) }
+	`, opts)
+
+	// NOTE(tsandall): we have to patch the implicit args on the else rule
+	// because of how the parser copies the arg names across from the first
+	// rule.
+	exp.Rules[0].Else.Head.Args[0] = VarTerm("__local2__")
+	exp.Rules[0].Else.Head.Args[1] = VarTerm("__local3__")
+
+	if !exp.Equal(c.Modules["test.rego"]) {
+		t.Fatalf("Expected:\n\n%v\n\nGot:\n\n%v", exp, c.Modules["test.rego"])
+	}
+}
+
+func TestCompilerMockFunction(t *testing.T) {
+	tests := []struct {
+		note          string
+		module, extra string
+		err           string
+	}{
+		{
+			note: "simple valid",
+			module: `package test
+				now() = 123
+				p { true with time.now_ns as now }
+			`,
+		},
+		{
+			note: "simple valid, simple name",
+			module: `package test
+				mock_concat(_, _) = "foo/bar"
+				p { concat("/", input) with concat as mock_concat }
+			`,
+		},
+		{
+			note: "invalid ref: nonexistant",
+			module: `package test
+				p { true with time.now_ns as now }
+			`,
+			err: "rego_unsafe_var_error: var now is unsafe", // we're running all compiler stages here
+		},
+		{
+			note: "valid ref: not a function, but arity = 0",
+			module: `package test
+				now = 1
+				p { true with time.now_ns as now }
+			`,
+		},
+		{
+			note: "ref: not a function, arity > 0",
+			module: `package test
+				http_send = { "body": "nope" }
+				p { true with http.send as http_send }
+			`,
+		},
+		{
+			note: "invalid ref: arity mismatch",
+			module: `package test
+				http_send(_, _) = { "body": "nope" }
+				p { true with http.send as http_send }
+			`,
+			err: "rego_type_error: http.send: arity mismatch\n\thave: (any, any)\n\twant: (request: object[string: any])",
+		},
+		{
+			note: "invalid ref: arity mismatch (in call)",
+			module: `package test
+				http_send(_, _) = { "body": "nope" }
+				p { http.send({}) with http.send as http_send }
+			`,
+			err: "rego_type_error: http.send: arity mismatch\n\thave: (any, any)\n\twant: (request: object[string: any])",
+		},
+		{
+			note: "invalid ref: value another built-in with different type",
+			module: `package test
+				p { true with http.send as net.lookup_ip_addr }
+			`,
+			err: "rego_type_error: http.send: arity mismatch\n\thave: (string)\n\twant: (request: object[string: any])",
+		},
+		{
+			note: "ref: value another built-in with compatible type",
+			module: `package test
+				p { true with count as object.union_n }
+			`,
+		},
+		{
+			note: "valid: package import",
+			extra: `package mocks
+				http_send(_) = {}
+			`,
+			module: `package test
+				import data.mocks
+				p { true with http.send as mocks.http_send }
+			`,
+		},
+		{
+			note: "valid: function import",
+			extra: `package mocks
+				http_send(_) = {}
+			`,
+			module: `package test
+				import data.mocks.http_send
+				p { true with http.send as http_send }
+			`,
+		},
+		{
+			note: "invalid target: relation",
+			module: `package test
+				my_walk(_, _)
+				p { true with walk as my_walk }
+			`,
+			err: "rego_compile_error: with keyword replacing built-in function: target must not be a relation",
+		},
+		{
+			note: "invalid target: eq",
+			module: `package test
+				my_eq(_, _)
+				p { true with eq as my_eq }
+			`,
+			err: `rego_compile_error: with keyword replacing built-in function: replacement of "eq" invalid`,
+		},
+		{
+			note: "invalid target: rego.metadata.chain",
+			module: `package test
+				p { true with rego.metadata.chain as [] }
+			`,
+			err: `rego_compile_error: with keyword replacing built-in function: replacement of "rego.metadata.chain" invalid`,
+		},
+		{
+			note: "invalid target: rego.metadata.rule",
+			module: `package test
+				p { true with rego.metadata.rule as {} }
+			`,
+			err: `rego_compile_error: with keyword replacing built-in function: replacement of "rego.metadata.rule" invalid`,
+		},
+		{
+			note: "invalid target: internal.print",
+			module: `package test
+				my_print(_, _)
+				p { true with internal.print as my_print }
+			`,
+			err: `rego_compile_error: with keyword replacing built-in function: replacement of internal function "internal.print" invalid`,
+		},
+		{
+			note: "mocking custom built-in",
+			module: `package test
+				mock(_)
+				mock_mock(_)
+				p { bar(foo.bar("one")) with bar as mock with foo.bar as mock_mock }
+			`,
+		},
+		{
+			note: "non-built-in function replaced value",
+			module: `package test
+				original(_)
+				p { original(true) with original as 123 }
+			`,
+		},
+		{
+			note: "non-built-in function replaced by another, arity 0",
+			module: `package test
+				original() = 1
+				mock() = 2
+				p { original() with original as mock }
+			`,
+			err: "rego_type_error: undefined function data.test.original", // TODO(sr): file bug -- this doesn't depend on "with" used or not
+		},
+		{
+			note: "non-built-in function replaced by another, arity 1",
+			module: `package test
+				original(_)
+				mock(_)
+				p { original(true) with original as mock }
+			`,
+		},
+		{
+			note: "non-built-in function replaced by built-in",
+			module: `package test
+				original(_)
+				p { original([1]) with original as count }
+			`,
+		},
+		{
+			note: "non-built-in function replaced by another, arity mismatch",
+			module: `package test
+				original(_)
+				mock(_, _)
+				p { original([1]) with original as mock }
+			`,
+			err: "rego_type_error: data.test.original: arity mismatch\n\thave: (any, any)\n\twant: (any)",
+		},
+		{
+			note: "non-built-in function replaced by built-in, arity mismatch",
+			module: `package test
+				original(_)
+				p { original([1]) with original as concat }
+			`,
+			err: "rego_type_error: data.test.original: arity mismatch\n\thave: (string, any<array[string], set[string]>)\n\twant: (any)",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.note, func(t *testing.T) {
+			c := NewCompiler().WithBuiltins(map[string]*Builtin{
+				"bar": {
+					Name: "bar",
+					Decl: types.NewFunction([]types.Type{types.S}, types.A),
+				},
+				"foo.bar": {
+					Name: "foo.bar",
+					Decl: types.NewFunction([]types.Type{types.S}, types.A),
+				},
+			})
+			if tc.extra != "" {
+				c.Modules["extra"] = MustParseModule(tc.extra)
+			}
+			c.Modules["test"] = MustParseModule(tc.module)
+
+			// NOTE(sr): We're running all compiler stages here, since the type checking of
+			// built-in function replacements happens at the type check stage.
+			c.Compile(c.Modules)
+
+			if tc.err != "" {
+				if !strings.Contains(c.Errors.Error(), tc.err) {
+					t.Errorf("expected error to contain %q, got %q", tc.err, c.Errors.Error())
+				}
+			} else if len(c.Errors) > 0 {
+				t.Errorf("expected no errors, got %v", c.Errors)
+			}
+		})
+	}
+
 }
 
 func TestCompilerMockVirtualDocumentPartially(t *testing.T) {
@@ -2816,6 +4696,449 @@ func TestCompilerMockVirtualDocumentPartially(t *testing.T) {
 
 	compileStages(c, c.rewriteWithModifiers)
 	assertCompilerErrorStrings(t, c, []string{"rego_compile_error: with keyword cannot partially replace virtual document(s)"})
+}
+
+func TestCompilerCheckUnusedAssignedVar(t *testing.T) {
+	type testCase struct {
+		note           string
+		module         string
+		expectedErrors Errors
+	}
+
+	cases := []testCase{
+		{
+			note: "global var",
+			module: `package test
+				x := 1
+			`,
+		},
+		{
+			note: "simple rule with wildcard",
+			module: `package test
+				p {
+					_ := 1
+				}
+			`,
+		},
+		{
+			note: "simple rule",
+			module: `package test
+				p {
+					x := 1
+					y := 2
+					z := x + 3
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+				&Error{Message: "assigned var z unused"},
+			},
+		},
+		{
+			note: "rule with return",
+			module: `package test
+				p = x {
+					x := 2
+					y := 3
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "rule with function call",
+			module: `package test
+				p {
+					x := 2
+					y := f(x)
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "rule with nested array comprehension",
+			module: `package test
+				p {
+					x := 2
+					y := [z | z := 2 * x]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "rule with nested array comprehension and shadowing",
+			module: `package test
+				p {
+					x := 2
+					y := [x | x := 2 * x]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "rule with nested array comprehension and shadowing (unused shadowed var)",
+			module: `package test
+				p {
+					x := 2
+					y := [x | x := 2]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var x unused"},
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "rule with nested array comprehension and shadowing (unused shadowing var)",
+			module: `package test
+				p {
+					x := 2
+					x > 1
+					[1 | x := 2]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var x unused"},
+			},
+		},
+		{
+			note: "rule with nested array comprehension and some declaration",
+			module: `package test
+				p {
+					some i
+					_ := [z | z := [1, 2][i]]
+				}
+			`,
+		},
+		{
+			note: "rule with nested set comprehension",
+			module: `package test
+				p {
+					x := 2
+					y := {z | z := 2 * x}
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "rule with nested set comprehension and unused inner var",
+			module: `package test
+				p {
+					x := 2
+					y := {z | z := 2 * x; a := 2}
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var a unused"}, // y isn't reported, as we abort early on errors when moving through the stack
+			},
+		},
+		{
+			note: "rule with nested object comprehension",
+			module: `package test
+				p {
+					x := 2
+					y := {z: x | z := 2 * x}
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "rule with nested closure",
+			module: `package test
+				p {
+					x := 1
+					a := 1
+					{ y | y := [ z | z:=[1,2,3][a]; z > 1 ][_] }
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var x unused"},
+			},
+		},
+		{
+			note: "rule with nested closure and unused inner var",
+			module: `package test
+				p {
+					x := 1
+					{ y | y := [ z | z:=[1,2,3][x]; z > 1; a := 2 ][_] }
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var a unused"},
+			},
+		},
+		{
+			note: "simple function",
+			module: `package test
+				f() {
+					x := 1
+					y := 2
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var x unused"},
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "simple function with wildcard",
+			module: `package test
+				f() {
+					x := 1
+					_ := 2
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var x unused"},
+			},
+		},
+		{
+			note: "function with return",
+			module: `package test
+				f() = x {
+					x := 1
+					y := 2
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "array comprehension",
+			module: `package test
+				comp = [ 1 |
+					x := [1, 2, 3]
+					y := 2
+					z := x[_]
+				]
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+				&Error{Message: "assigned var z unused"},
+			},
+		},
+		{
+			note: "array comprehension nested",
+			module: `package test
+				comp := [ 1 |
+					x := 1
+					y := [a | a := x]
+				]
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "array comprehension with wildcard",
+			module: `package test
+				comp = [ 1 |
+					x := [1, 2, 3]
+					_ := 2
+					z := x[_]
+				]
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var z unused"},
+			},
+		},
+		{
+			note: "array comprehension with return",
+			module: `package test
+				comp = [ z |
+					x := [1, 2, 3]
+					y := 2
+					z := x[_]
+				]
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "array comprehension with some",
+			module: `package test
+				comp = [ i |
+					some i
+					y := 2
+				]
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "set comprehension",
+			module: `package test
+				comp = { 1 |
+					x := [1, 2, 3]
+					y := 2
+					z := x[_]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+				&Error{Message: "assigned var z unused"},
+			},
+		},
+		{
+			note: "set comprehension nested",
+			module: `package test
+				comp := { 1 |
+					x := 1
+					y := [a | a := x]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "set comprehension with wildcard",
+			module: `package test
+				comp = { 1 |
+					x := [1, 2, 3]
+					_ := 2
+					z := x[_]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var z unused"},
+			},
+		},
+		{
+			note: "set comprehension with return",
+			module: `package test
+				comp = { z |
+					x := [1, 2, 3]
+					y := 2
+					z := x[_]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "set comprehension with some",
+			module: `package test
+				comp = { i |
+					some i
+					y := 2
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "object comprehension",
+			module: `package test
+				comp = { 1: 2 |
+					x := [1, 2, 3]
+					y := 2
+					z := x[_]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+				&Error{Message: "assigned var z unused"},
+			},
+		},
+		{
+			note: "object comprehension nested",
+			module: `package test
+				comp := { 1: 1 |
+					x := 1
+					y := {a: x | a := x}
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "object comprehension with wildcard",
+			module: `package test
+				comp = { 1: 2 |
+					x := [1, 2, 3]
+					_ := 2
+					z := x[_]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var z unused"},
+			},
+		},
+		{
+			note: "object comprehension with return",
+			module: `package test
+				comp = { z: x |
+					x := [1, 2, 3]
+					y := 2
+					z := x[_]
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "object comprehension with some",
+			module: `package test
+				comp = { i |
+					some i
+					y := 2
+				}
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+		{
+			note: "every: unused assigned var in body",
+			module: `package test
+				p { every i in [1] { y := 10; i == 1 } }
+			`,
+			expectedErrors: Errors{
+				&Error{Message: "assigned var y unused"},
+			},
+		},
+	}
+
+	makeTestRunner := func(tc testCase, strict bool) func(t *testing.T) {
+		return func(t *testing.T) {
+			compiler := NewCompiler().WithStrict(strict)
+			opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
+			compiler.Modules = map[string]*Module{
+				"test": MustParseModuleWithOpts(tc.module, opts),
+			}
+			compileStages(compiler, compiler.rewriteLocalVars)
+
+			if strict {
+				assertErrors(t, compiler.Errors, tc.expectedErrors, false)
+			} else {
+				assertNotFailed(t, compiler)
+			}
+		}
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note+"_strict", makeTestRunner(tc, true))
+		t.Run(tc.note+"_non-strict", makeTestRunner(tc, false))
+	}
 }
 
 func TestCompilerSetGraph(t *testing.T) {
@@ -3089,6 +5412,14 @@ dataref = true { data }`,
 			x = "foo.bar"
 			foo(x, y)
 		}`),
+		"everyMod": MustParseModule(`package everymod
+		import future.keywords.every
+		everyp {
+			every x in [true, false] { x; everyp }
+		}
+		everyq[1] {
+			every x in everyq { x == 1 }
+		}`),
 	}
 
 	compileStages(c, c.checkRecursion)
@@ -3122,6 +5453,8 @@ dataref = true { data }`,
 		makeRuleErrMsg("bar", "bar", "p", "foo", "bar"),
 		makeRuleErrMsg("foo", "foo", "bar", "p", "foo"),
 		makeRuleErrMsg("p", "p", "foo", "bar", "p"),
+		makeRuleErrMsg("everyp", "everyp", "everyp"),
+		makeRuleErrMsg("everyq", "everyq", "everyq"),
 	}
 
 	result := compilerErrsToStringSlice(c.Errors)
@@ -3142,24 +5475,55 @@ func TestCompilerCheckDynamicRecursion(t *testing.T) {
 	// This test tries to circumvent the recursion check by using dynamic
 	// references.  For more background info, see
 	// <https://github.com/open-policy-agent/opa/issues/1565>.
-	c := NewCompiler()
-	c.Modules = map[string]*Module{
-		"recursion": MustParseModule(`package recursion
 
+	for note, mod := range map[string]*Module{
+		"recursion": MustParseModule(`
+package recursion
 pkg = "recursion"
-
 foo[x] {
-  data[pkg]["foo"][x]
-}`),
+	data[pkg]["foo"][x]
+}
+`),
+		"system.main": MustParseModule(`
+package system.main
+foo {
+  data[input]
+}
+`),
+	} {
+		t.Run(note, func(t *testing.T) {
+			c := NewCompiler()
+			c.Modules = map[string]*Module{note: mod}
+			compileStages(c, c.checkRecursion)
+
+			result := compilerErrsToStringSlice(c.Errors)
+			expected := "rego_recursion_error: rule foo is recursive: foo -> foo"
+
+			if len(result) != 1 || result[0] != expected {
+				t.Errorf("Expected %v but got: %v", expected, result)
+			}
+		})
 	}
+}
 
-	compileStages(c, c.checkRecursion)
+func TestCompilerCheckVoidCalls(t *testing.T) {
+	c := NewCompiler().WithCapabilities(&Capabilities{Builtins: []*Builtin{
+		{
+			Name: "test",
+			Decl: types.NewFunction([]types.Type{types.B}, nil),
+		},
+	}})
+	c.Compile(map[string]*Module{
+		"test.rego": MustParseModule(`package test
 
-	result := compilerErrsToStringSlice(c.Errors)
-	expected := "rego_recursion_error: rule foo is recursive: foo -> foo"
-
-	if len(result) != 1 || result[0] != expected {
-		t.Errorf("Expected %v but got: %v", expected, result)
+		p {
+			x = test(true)
+		}`),
+	})
+	if !c.Failed() {
+		t.Fatal("expected error")
+	} else if c.Errors[0].Code != TypeErr || c.Errors[0].Message != "test(true) used as value" {
+		t.Fatal("unexpected error:", c.Errors)
 	}
 }
 
@@ -3412,6 +5776,8 @@ r1 = 1`,
 r2 = 2`,
 		"mod3": `package a.b
 r3 = 3`,
+		"hidden": `package system.hidden
+r4 = 4`,
 	})
 
 	compileStages(compiler, nil)
@@ -3419,25 +5785,31 @@ r3 = 3`,
 	rule1 := compiler.Modules["mod1"].Rules[0]
 	rule2 := compiler.Modules["mod2"].Rules[0]
 	rule3 := compiler.Modules["mod3"].Rules[0]
+	rule4 := compiler.Modules["hidden"].Rules[0]
 
 	tests := []struct {
-		input    string
-		expected []*Rule
+		input         string
+		expected      []*Rule
+		excludeHidden bool
 	}{
-		{"data.a.b.c.d.r1", []*Rule{rule1}},
-		{"data.a.b[x]", []*Rule{rule1, rule2, rule3}},
-		{"data.a.b[x].d", []*Rule{rule1, rule3}},
-		{"data.a.b.c", []*Rule{rule1, rule2}},
-		{"data.a.b.d", nil},
-		{"data[x]", []*Rule{rule1, rule2, rule3}},
-		{"data[data.complex_computation].b[y]", []*Rule{rule1, rule2, rule3}},
-		{"data[x][y].c.e", []*Rule{rule2}},
-		{"data[x][y].r3", []*Rule{rule3}},
+		{input: "data.a.b.c.d.r1", expected: []*Rule{rule1}},
+		{input: "data.a.b[x]", expected: []*Rule{rule1, rule2, rule3}},
+		{input: "data.a.b[x].d", expected: []*Rule{rule1, rule3}},
+		{input: "data.a.b.c", expected: []*Rule{rule1, rule2}},
+		{input: "data.a.b.d"},
+		{input: "data[x]", expected: []*Rule{rule1, rule2, rule3, rule4}},
+		{input: "data[data.complex_computation].b[y]", expected: []*Rule{rule1, rule2, rule3}},
+		{input: "data[x][y].c.e", expected: []*Rule{rule2}},
+		{input: "data[x][y].r3", expected: []*Rule{rule3}},
+		{input: "data[x][y]", expected: []*Rule{rule1, rule2, rule3}, excludeHidden: true}, // old behaviour of GetRulesDynamic
 	}
 
 	for _, tc := range tests {
 		t.Run(tc.input, func(t *testing.T) {
-			result := compiler.GetRulesDynamic(MustParseRef(tc.input))
+			result := compiler.GetRulesDynamicWithOpts(
+				MustParseRef(tc.input),
+				RulesOptions{IncludeHiddenModules: !tc.excludeHidden},
+			)
 
 			if len(result) != len(tc.expected) {
 				t.Fatalf("Expected %v but got: %v", tc.expected, result)
@@ -3945,6 +6317,19 @@ func TestCompilerBuildComprehensionIndexKeySet(t *testing.T) {
 	}
 }
 
+func TestCompilerAllowMultipleAssignments(t *testing.T) {
+
+	_, err := CompileModules(map[string]string{"test.rego": `
+		package test
+
+		p := 7
+		p := 8
+	`})
+	if err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestQueryCompiler(t *testing.T) {
 	tests := []struct {
 		note     string
@@ -3962,12 +6347,12 @@ func TestQueryCompiler(t *testing.T) {
 		{
 			note:     "invalid eq",
 			q:        "eq()",
-			expected: fmt.Errorf("too few arguments"),
+			expected: fmt.Errorf("1 error occurred: 1:1: rego_type_error: eq: arity mismatch\n\thave: ()\n\twant: (any, any)"),
 		},
 		{
 			note:     "invalid eq",
 			q:        "eq(1)",
-			expected: fmt.Errorf("too few arguments"),
+			expected: fmt.Errorf("1 error occurred: 1:1: rego_type_error: eq: arity mismatch\n\thave: (number)\n\twant: (any, any)"),
 		},
 		{
 			note:     "rewrite assignment",
@@ -4005,6 +6390,11 @@ func TestQueryCompiler(t *testing.T) {
 			expected: fmt.Errorf("1 error occurred: 1:1: rego_unsafe_var_error: var z is unsafe"),
 		},
 		{
+			note:     "unsafe var that is a future keyword",
+			q:        "1 in 2",
+			expected: fmt.Errorf("1 error occurred: 1:3: rego_unsafe_var_error: var in is unsafe (hint: `import future.keywords.in` to import a future keyword)"),
+		},
+		{
 			note:     "unsafe declared var",
 			q:        "[1 | some x; x == 1]",
 			pkg:      "",
@@ -4030,7 +6420,7 @@ func TestQueryCompiler(t *testing.T) {
 			q:        "x = 1 with foo.p as null",
 			pkg:      "",
 			imports:  nil,
-			expected: fmt.Errorf("1 error occurred: 1:12: rego_type_error: with keyword target must start with input or data"),
+			expected: fmt.Errorf("1 error occurred: 1:12: rego_type_error: with keyword target must reference existing input, data, or a function"),
 		},
 		{
 			note:     "rewrite with value",
@@ -4040,11 +6430,25 @@ func TestQueryCompiler(t *testing.T) {
 			expected: `__localq1__ = data.a.b.c.z; __localq0__ = [__localq1__]; 1 with input as __localq0__`,
 		},
 		{
-			note:     "unsafe exprs",
+			note:     "built-in function arity mismatch",
+			q:        `startswith("x")`,
+			pkg:      "",
+			imports:  nil,
+			expected: fmt.Errorf("1 error occurred: 1:1: rego_type_error: startswith: arity mismatch\n\thave: (string)\n\twant: (search: string, base: string)"),
+		},
+		{
+			note:     "built-in function arity mismatch (arity 0)",
+			q:        `x := opa.runtime("foo")`,
+			pkg:      "",
+			imports:  nil,
+			expected: fmt.Errorf("1 error occurred: 1:6: rego_type_error: opa.runtime: arity mismatch\n\thave: (string, ???)\n\twant: ()"),
+		},
+		{
+			note:     "built-in function arity mismatch, nested",
 			q:        "count(sum())",
 			pkg:      "",
 			imports:  nil,
-			expected: fmt.Errorf("1 error occurred: 1:1: rego_unsafe_var_error: expression is unsafe"),
+			expected: fmt.Errorf("1 error occurred: 1:7: rego_type_error: sum: arity mismatch\n\thave: (???)\n\twant: (collection: any<array[number], set[number]>)"),
 		},
 		{
 			note:     "check types",
@@ -4065,9 +6469,19 @@ func TestQueryCompiler(t *testing.T) {
 			imports:  []string{"import input.xyz as abc"},
 			expected: "input.xyz",
 		},
+		{
+			note:     "void call used as value",
+			q:        "x = print(1)",
+			expected: fmt.Errorf("rego_type_error: print(1) used as value"),
+		},
+		{
+			note:     "print call erasure",
+			q:        `print(1)`,
+			expected: "true",
+		},
 	}
 	for _, tc := range tests {
-		runQueryCompilerTest(t, tc.note, tc.q, tc.pkg, tc.imports, tc.expected)
+		t.Run(tc.note, runQueryCompilerTest(tc.q, tc.pkg, tc.imports, tc.expected))
 	}
 }
 
@@ -4193,6 +6607,107 @@ func TestQueryCompilerWithUnsafeBuiltins(t *testing.T) {
 	}
 }
 
+func TestQueryCompilerWithDeprecatedBuiltins(t *testing.T) {
+	cases := []strictnessQueryTestCase{
+		{
+			note:           "all() built-in",
+			query:          "all([true, false])",
+			expectedErrors: fmt.Errorf("1 error occurred: 1:1: rego_type_error: deprecated built-in function calls in expression: all"),
+		},
+		{
+			note:           "any() built-in",
+			query:          "any([true, false])",
+			expectedErrors: fmt.Errorf("1 error occurred: 1:1: rego_type_error: deprecated built-in function calls in expression: any"),
+		},
+	}
+
+	runStrictnessQueryTestCase(t, cases)
+}
+
+func TestQueryCompilerWithUnusedAssignedVar(t *testing.T) {
+	cases := []strictnessQueryTestCase{
+		{
+			note:           "array comprehension",
+			query:          "[1 | x := 2]",
+			expectedErrors: fmt.Errorf("1 error occurred: 1:6: rego_compile_error: assigned var x unused"),
+		},
+		{
+			note:           "set comprehension",
+			query:          "{1 | x := 2}",
+			expectedErrors: fmt.Errorf("1 error occurred: 1:6: rego_compile_error: assigned var x unused"),
+		},
+		{
+			note:           "object comprehension",
+			query:          "{1: 2 | x := 2}",
+			expectedErrors: fmt.Errorf("1 error occurred: 1:9: rego_compile_error: assigned var x unused"),
+		},
+		{
+			note:           "every: unused var in body",
+			query:          "every _ in [] { x := 10 }",
+			expectedErrors: fmt.Errorf("1 error occurred: 1:17: rego_compile_error: assigned var x unused"),
+		},
+	}
+
+	runStrictnessQueryTestCase(t, cases)
+}
+
+func TestQueryCompilerCheckKeywordOverrides(t *testing.T) {
+	cases := []strictnessQueryTestCase{
+		{
+			note:           "input assigned",
+			query:          "input := 1",
+			expectedErrors: fmt.Errorf("1 error occurred: 1:1: rego_compile_error: variables must not shadow input (use a different variable name)"),
+		},
+		{
+			note:           "data assigned",
+			query:          "data := 1",
+			expectedErrors: fmt.Errorf("1 error occurred: 1:1: rego_compile_error: variables must not shadow data (use a different variable name)"),
+		},
+		{
+			note:           "nested input assigned",
+			query:          "d := [input | input := 1]",
+			expectedErrors: fmt.Errorf("1 error occurred: 1:15: rego_compile_error: variables must not shadow input (use a different variable name)"),
+		},
+	}
+
+	runStrictnessQueryTestCase(t, cases)
+}
+
+type strictnessQueryTestCase struct {
+	note           string
+	query          string
+	expectedErrors error
+}
+
+func runStrictnessQueryTestCase(t *testing.T, cases []strictnessQueryTestCase) {
+	t.Helper()
+	makeTestRunner := func(tc strictnessQueryTestCase, strict bool) func(t *testing.T) {
+		return func(t *testing.T) {
+			c := NewCompiler().WithStrict(strict)
+			opts := ParserOptions{AllFutureKeywords: true, unreleasedKeywords: true}
+			result, err := c.QueryCompiler().Compile(MustParseBodyWithOpts(tc.query, opts))
+
+			if strict {
+				if err == nil {
+					t.Fatalf("Expected error from %v but got: %v", tc.query, result)
+				}
+				if !strings.Contains(err.Error(), tc.expectedErrors.Error()) {
+					t.Fatalf("Expected error %v but got: %v", tc.expectedErrors, err)
+				}
+			} else {
+				if err != nil {
+					t.Fatalf("Unexpected error from %v: %v", tc.query, err)
+				}
+			}
+		}
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.note+"_strict", makeTestRunner(tc, true))
+		t.Run(tc.note+"_non-strict", makeTestRunner(tc, false))
+	}
+}
+
 func assertCompilerErrorStrings(t *testing.T, compiler *Compiler, expected []string) {
 	result := compilerErrsToStringSlice(compiler.Errors)
 
@@ -4207,6 +6722,7 @@ func assertCompilerErrorStrings(t *testing.T, compiler *Compiler, expected []str
 }
 
 func assertNotFailed(t *testing.T, c *Compiler) {
+	t.Helper()
 	if c.Failed() {
 		t.Fatalf("Unexpected compilation error: %v", c.Errors)
 	}
@@ -4362,9 +6878,10 @@ func compilerErrsToStringSlice(errors []*Error) []string {
 	return result
 }
 
-func runQueryCompilerTest(t *testing.T, note, q, pkg string, imports []string, expected interface{}) {
-	t.Run(note, func(t *testing.T) {
-		c := NewCompiler()
+func runQueryCompilerTest(q, pkg string, imports []string, expected interface{}) func(*testing.T) {
+	return func(t *testing.T) {
+		t.Helper()
+		c := NewCompiler().WithEnablePrintStatements(false)
 		c.Compile(getCompilerTestModules())
 		assertNotFailed(t, c)
 		qc := c.QueryCompiler()
@@ -4401,7 +6918,7 @@ func runQueryCompilerTest(t *testing.T, note, q, pkg string, imports []string, e
 				t.Fatalf("Expected error %v but got: %v", expected, err)
 			}
 		}
-	})
+	}
 }
 
 func TestCompilerCapabilitiesExtendedWithCustomBuiltins(t *testing.T) {
@@ -4487,869 +7004,154 @@ func TestCompilerPassesTypeCheckNegative(t *testing.T) {
 	}
 }
 
-func TestWithSchema(t *testing.T) {
-	c := NewCompiler()
-	schemaSet := NewSchemaSet()
-	schemaSet.Put(SchemaRootRef, objectSchema)
-	c.WithSchemas(schemaSet)
-	if c.schemaSet == nil {
-		t.Fatalf("WithSchema did not set the schema correctly in the compiler")
-	}
+func TestKeepModules(t *testing.T) {
+
+	t.Run("no keep", func(t *testing.T) {
+		c := NewCompiler() // no keep is default
+
+		// This one is overwritten by c.Compile()
+		c.Modules["foo.rego"] = MustParseModule("package foo\np = true")
+
+		c.Compile(map[string]*Module{"bar.rego": MustParseModule("package bar\np = input")})
+
+		if len(c.Errors) != 0 {
+			t.Fatalf("expected no error; got %v", c.Errors)
+		}
+
+		mods := c.ParsedModules()
+		if mods != nil {
+			t.Errorf("expected ParsedModules == nil, got %v", mods)
+		}
+	})
+
+	t.Run("keep", func(t *testing.T) {
+
+		c := NewCompiler().WithKeepModules(true)
+
+		// This one is overwritten by c.Compile()
+		c.Modules["foo.rego"] = MustParseModule("package foo\np = true")
+
+		c.Compile(map[string]*Module{"bar.rego": MustParseModule("package bar\np = input")})
+		if len(c.Errors) != 0 {
+			t.Fatalf("expected no error; got %v", c.Errors)
+		}
+
+		mods := c.ParsedModules()
+		if exp, act := 1, len(mods); exp != act {
+			t.Errorf("expected %d modules, found %d: %v", exp, act, mods)
+		}
+		for k := range mods {
+			if k != "bar.rego" {
+				t.Errorf("unexpected key: %v, want 'bar.rego'", k)
+			}
+		}
+
+		for k := range mods {
+			compiled := c.Modules[k]
+			if compiled.Equal(mods[k]) {
+				t.Errorf("expected module %v to not be compiled: %v", k, mods[k])
+			}
+		}
+
+		// expect ParsedModules to be reset
+		c.Compile(map[string]*Module{"baz.rego": MustParseModule("package baz\np = input")})
+		mods = c.ParsedModules()
+		if exp, act := 1, len(mods); exp != act {
+			t.Errorf("expected %d modules, found %d: %v", exp, act, mods)
+		}
+		for k := range mods {
+			if k != "baz.rego" {
+				t.Errorf("unexpected key: %v, want 'baz.rego'", k)
+			}
+		}
+
+		for k := range mods {
+			compiled := c.Modules[k]
+			if compiled.Equal(mods[k]) {
+				t.Errorf("expected module %v to not be compiled: %v", k, mods[k])
+			}
+		}
+
+		// expect ParsedModules to be reset to nil
+		c = c.WithKeepModules(false)
+		c.Compile(map[string]*Module{"baz.rego": MustParseModule("package baz\np = input")})
+		mods = c.ParsedModules()
+		if mods != nil {
+			t.Errorf("expected ParsedModules == nil, got %v", mods)
+		}
+	})
+
+	t.Run("no copies", func(t *testing.T) {
+		extra := MustParseModule("package extra\np = input")
+		done := false
+		testLoader := func(map[string]*Module) (map[string]*Module, error) {
+			if done {
+				return nil, nil
+			}
+			done = true
+			return map[string]*Module{"extra.rego": extra}, nil
+		}
+
+		c := NewCompiler().WithModuleLoader(testLoader).WithKeepModules(true)
+
+		mod := MustParseModule("package bar\np = input")
+		c.Compile(map[string]*Module{"bar.rego": mod})
+		if len(c.Errors) != 0 {
+			t.Fatalf("expected no error; got %v", c.Errors)
+		}
+
+		mods := c.ParsedModules()
+		if exp, act := 2, len(mods); exp != act {
+			t.Errorf("expected %d modules, found %d: %v", exp, act, mods)
+		}
+		newName := Var("q")
+		mods["bar.rego"].Rules[0].Head.Name = newName
+		if exp, act := newName, mod.Rules[0].Head.Name; !exp.Equal(act) {
+			t.Errorf("expected modified rule name %v, found %v", exp, act)
+		}
+		mods["extra.rego"].Rules[0].Head.Name = newName
+		if exp, act := newName, extra.Rules[0].Head.Name; !exp.Equal(act) {
+			t.Errorf("expected modified rule name %v, found %v", exp, act)
+		}
+	})
+
+	t.Run("keep, with loader", func(t *testing.T) {
+		extra := MustParseModule("package extra\np = input")
+		done := false
+		testLoader := func(map[string]*Module) (map[string]*Module, error) {
+			if done {
+				return nil, nil
+			}
+			done = true
+			return map[string]*Module{"extra.rego": extra}, nil
+		}
+
+		c := NewCompiler().WithModuleLoader(testLoader).WithKeepModules(true)
+
+		// This one is overwritten by c.Compile()
+		c.Modules["foo.rego"] = MustParseModule("package foo\np = true")
+
+		c.Compile(map[string]*Module{"bar.rego": MustParseModule("package bar\np = input")})
+
+		if len(c.Errors) != 0 {
+			t.Fatalf("expected no error; got %v", c.Errors)
+		}
+
+		mods := c.ParsedModules()
+		if exp, act := 2, len(mods); exp != act {
+			t.Errorf("expected %d modules, found %d: %v", exp, act, mods)
+		}
+		for k := range mods {
+			if k != "bar.rego" && k != "extra.rego" {
+				t.Errorf("unexpected key: %v, want 'extra.rego' and 'bar.rego'", k)
+			}
+		}
+
+		for k := range mods {
+			compiled := c.Modules[k]
+			if compiled.Equal(mods[k]) {
+				t.Errorf("expected module %v to not be compiled: %v", k, mods[k])
+			}
+		}
+	})
 }
-
-func TestAnyOfObjectSchema1(t *testing.T) {
-	c := NewCompiler()
-	schemaSet := NewSchemaSet()
-	schemaSet.Put(SchemaRootRef, anyOfExtendCoreSchema)
-	c.WithSchemas(schemaSet)
-	if c.schemaSet == nil {
-		t.Fatalf("Did not correctly compile an object type schema with anyOf outside core schema")
-	}
-}
-
-func TestAnyOfObjectSchema2(t *testing.T) {
-	c := NewCompiler()
-	schemaSet := NewSchemaSet()
-	schemaSet.Put(SchemaRootRef, anyOfInsideCoreSchema)
-	c.WithSchemas(schemaSet)
-	if c.schemaSet == nil {
-		t.Fatalf("Did not correctly compile an object type schema with anyOf inside core schema")
-	}
-}
-
-func TestAnyOfArraySchema(t *testing.T) {
-	c := NewCompiler()
-	schemaSet := NewSchemaSet()
-	schemaSet.Put(SchemaRootRef, anyOfArraySchema)
-	c.WithSchemas(schemaSet)
-	if c.schemaSet == nil {
-		t.Fatalf("Did not correctly compile an array type schema with anyOf")
-	}
-}
-
-func TestAnyOfObjectMissing(t *testing.T) {
-	c := NewCompiler()
-	schemaSet := NewSchemaSet()
-	schemaSet.Put(SchemaRootRef, anyOfObjectMissing)
-	c.WithSchemas(schemaSet)
-	if c.schemaSet == nil {
-		t.Fatalf("Did not correctly compile an object type schema with anyOf where one of the props did not explicitly claim type")
-	}
-}
-
-func TestAnyOfArrayMissing(t *testing.T) {
-	c := NewCompiler()
-	schemaSet := NewSchemaSet()
-	schemaSet.Put(SchemaRootRef, anyOfArrayMissing)
-	c.WithSchemas(schemaSet)
-	if c.schemaSet == nil {
-		t.Fatalf("Did not correctly compile an array type schema with anyOf where items are inside anyOf")
-	}
-}
-
-const objectSchema = `{
-	"$schema": "http://json-schema.org/draft-07/schema",
-	"$id": "http://example.com/example.json",
-	"type": "object",
-	"title": "The root schema",
-	"description": "The root schema comprises the entire JSON document.",
-	"required": [
-		"foo",
-		"b"
-	],
-	"properties": {
-		"foo": {
-			"$id": "#/properties/foo",
-			"type": "string",
-			"title": "The foo schema",
-			"description": "An explanation about the purpose of this instance."
-		},
-		"b": {
-			"$id": "#/properties/b",
-			"type": "array",
-			"title": "The b schema",
-			"description": "An explanation about the purpose of this instance.",
-			"additionalItems": false,
-			"items": {
-				"$id": "#/properties/b/items",
-				"type": "object",
-				"title": "The items schema",
-				"description": "An explanation about the purpose of this instance.",
-				"required": [
-					"a",
-					"b",
-					"c"
-				],
-				"properties": {
-					"a": {
-						"$id": "#/properties/b/items/properties/a",
-						"type": "integer",
-						"title": "The a schema",
-						"description": "An explanation about the purpose of this instance."
-					},
-					"b": {
-						"$id": "#/properties/b/items/properties/b",
-						"type": "array",
-						"title": "The b schema",
-						"description": "An explanation about the purpose of this instance.",
-						"additionalItems": false,
-						"items": {
-							"$id": "#/properties/b/items/properties/b/items",
-							"type": "integer",
-							"title": "The items schema",
-							"description": "An explanation about the purpose of this instance."
-						}
-					},
-					"c": {
-						"$id": "#/properties/b/items/properties/c",
-						"type": "null",
-						"title": "The c schema",
-						"description": "An explanation about the purpose of this instance."
-					}
-				},
-				"additionalProperties": false
-			}
-		}
-	},
-	"additionalProperties": false
-}`
-
-const arrayNoItemsSchema = `{
-	"$schema": "http://json-schema.org/draft-07/schema",
-	"$id": "http://example.com/example.json",
-	"type": "object",
-	"title": "The root schema",
-	"description": "The root schema comprises the entire JSON document.",
-	"required": [
-		"b"
-	],
-	"properties": {
-		"b": {
-			"$id": "#/properties/b",
-			"type": "array",
-			"title": "The b schema",
-			"description": "An explanation about the purpose of this instance.",
-			"additionalItems": true
-		}
-	},
-	"additionalProperties": false
-}`
-
-const noChildrenObjectSchema = `{
-	"$schema": "http://json-schema.org/draft-07/schema",
-	"$id": "http://example.com/example.json",
-	"type": "object",
-	"title": "The root schema",
-	"description": "The root schema comprises the entire JSON document.",
-	"additionalProperties": true
-}`
-
-const untypedFieldObjectSchema = `{
-	"$schema": "http://json-schema.org/draft-07/schema",
-	"$id": "http://example.com/example.json",
-	"type": "object",
-	"title": "The root schema",
-	"description": "The root schema comprises the entire JSON document.",
-	"required": [
-		"foo"
-	],
-	"properties": {
-		"foo": {
-			"$id": "#/properties/foo"
-		}
-	},
-	"additionalProperties": false
-}`
-
-const booleanSchema = `{
-	"$schema": "http://json-schema.org/draft-07/schema",
-	"$id": "http://example.com/example.json",
-	"type": "object",
-	"title": "The root schema",
-	"description": "The root schema comprises the entire JSON document.",
-	"required": [
-		"a"
-	],
-	"properties": {
-		"a": {
-			"$id": "#/properties/foo",
-			"type": "boolean",
-			"title": "The foo schema",
-			"description": "An explanation about the purpose of this instance."
-		}
-	},
-	"additionalProperties": false
-}`
-
-const refSchema = `
-{
-    "description": "Pod is a collection of containers that can run on a host. This resource is created by clients and scheduled onto hosts.",
-	"type": "object",
-	"properties": {
-      "apiVersion": {
-        "description": "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#resources",
-        "type": [
-          "string",
-          "null"
-        ]
-	  },
-
-      "kind": {
-        "description": "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#types-kinds",
-        "type": [
-          "string",
-          "null"
-        ],
-        "enum": [
-          "Pod"
-        ]
-      },
-      "metadata": {
-        "$ref": "https://kubernetesjsonschema.dev/v1.14.0/_definitions.json#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
-        "description": "Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata"
-	  }
-	}
-}
-`
-const podSchema = `
-{
-    "description": "Pod is a collection of containers that can run on a host. This resource is created by clients and scheduled onto hosts.",
-    "properties": {
-      "apiVersion": {
-        "description": "APIVersion defines the versioned schema of this representation of an object. Servers should convert recognized schemas to the latest internal value, and may reject unrecognized values. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#resources",
-        "type": [
-          "string",
-          "null"
-        ]
-      },
-      "kind": {
-        "description": "Kind is a string value representing the REST resource this object represents. Servers may infer this from the endpoint the client submits requests to. Cannot be updated. In CamelCase. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#types-kinds",
-        "type": [
-          "string",
-          "null"
-        ],
-        "enum": [
-          "Pod"
-        ]
-      },
-      "metadata": {
-        "$ref": "https://kubernetesjsonschema.dev/v1.14.0/_definitions.json#/definitions/io.k8s.apimachinery.pkg.apis.meta.v1.ObjectMeta",
-        "description": "Standard object's metadata. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#metadata"
-      },
-      "spec": {
-        "$ref": "https://kubernetesjsonschema.dev/v1.14.0/_definitions.json#/definitions/io.k8s.api.core.v1.PodSpec",
-        "description": "Specification of the desired behavior of the pod. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#spec-and-status"
-      },
-      "status": {
-        "$ref": "https://kubernetesjsonschema.dev/v1.14.0/_definitions.json#/definitions/io.k8s.api.core.v1.PodStatus",
-        "description": "Most recently observed status of the pod. This data may not be up to date. Populated by the system. Read-only. More info: https://git.k8s.io/community/contributors/devel/api-conventions.md#spec-and-status"
-      }
-    },
-    "type": "object",
-    "x-kubernetes-group-version-kind": [
-      {
-        "group": "",
-        "kind": "Pod",
-        "version": "v1"
-      }
-    ],
-    "$schema": "http://json-schema.org/schema#"
-  }`
-
-const anyOfArraySchema = `{
-	"type": "object",
-	"properties": {
-		"familyMembers": {
-			"type": "array",
-			"items": {
-				"anyOf": [
-					{
-						"type": "object",
-						"properties": {
-							"age": { "type": "integer" },
-							"name": {"type": "string"}
-						}
-					},{
-						"type": "object",
-						"properties": {
-							"personality": { "type": "string" },
-							"nickname": { "type": "string"  }
-						}
-					}
-				]
-			}
-		}
-	}
-}`
-
-const anyOfExtendCoreSchema = `{
-	"type": "object",
-	"properties": {
-		"AddressLine": { "type": "string" }
-	},
-	"anyOf": [
-		{
-			"type": "object",
-			"properties": {
-				"State":   { "type": "string" },
-				"ZipCode": { "type": "string" }
-			}
-		},
-		{
-			"type": "object",
-			"properties": {
-				"County":   { "type": "string" },
-				"PostCode": { "type": "integer" }
-			}
-		}
-	]
-}`
-
-const allOfObjectSchema = `{
-    "$schema": "http://json-schema.org/draft-04/schema#",
-    "type": "object",
-    "title": "My schema",
-    "properties": {
-        "AddressLine1": { "type": "string" },
-        "AddressLine2": { "type": "string" },
-        "City":         { "type": "string" }
-    },
-    "allOf": [
-        {
-            "type": "object",
-            "properties": {
-                "State":   { "type": "string" },
-                "ZipCode": { "type": "string" }
-            },
-        },
-        {
-            "type": "object",
-            "properties": {
-                "County":   { "type": "string" },
-                "PostCode": { "type": "string" }
-            },
-        }
-    ]
-}`
-
-const allOfArraySchema = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "array",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"items": {
-		"type": "integer",
-		"title": "The items schema",
-		"description": "An explanation about the purpose of this instance."
-	},
-	"allOf": [
-		{
-		"type": "array",
-		"title": "The b schema",
-		"description": "An explanation about the purpose of this instance.",
-		"items": {	
-			"type": "integer",
-			"title": "The items schema",
-			"description": "An explanation about the purpose of this instance."
-		}
-		},
-		{
-		"type": "array",
-		"title": "The b schema",
-		"description": "An explanation about the purpose of this instance.",
-		"items": {
-			"type": "integer",
-			"title": "The items schema",
-			"description": "An explanation about the purpose of this instance."
-		}
-		}
-	]
-}`
-
-const allOfSchemaParentVariation = `{
-    "$schema": "http://json-schema.org/draft-04/schema#",
-    "allOf": [
-        {
-            "type": "object",
-            "properties": {
-                "State":   { "type": "string" },
-                "ZipCode": { "type": "string" }
-            },
-        },
-        {
-            "type": "object",
-            "properties": {
-                "County":   { "type": "string" },
-                "PostCode": { "type": "string" }
-            },
-        }
-    ]
-}`
-
-const emptySchema = `{
-	"allof" : []
- }`
-
-const allOfArrayOfArrays = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "array",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"items": {
-		"type": "array",
-		"title": "The items schema",
-		"description": "An explanation about the purpose of this instance.",
-		"items": {
-			"type": "integer",
-			"title": "The items schema",
-			"description": "An explanation about the purpose of this instance."
-		}
-	},
-	"allOf": [{
-			"type": "array",
-			"title": "The b schema",
-			"description": "An explanation about the purpose of this instance.",
-			"items": {
-				"type": "array",
-				"title": "The items schema",
-				"description": "An explanation about the purpose of this instance.",
-				"items": {
-					"type": "integer",
-					"title": "The items schema",
-					"description": "An explanation about the purpose of this instance."
-				}
-			}
-		},
-		{
-			"type": "array",
-			"title": "The b schema",
-			"description": "An explanation about the purpose of this instance.",
-			"items": {
-				"type": "integer",
-				"title": "The items schema",
-				"description": "An explanation about the purpose of this instance."
-			}
-		}
-	]
-}`
-
-const anyOfInsideCoreSchema = ` {
-	"type": "object",
-	"properties": {
-		"AddressLine": { "type": "string" },
-		"RandomInfo": {
-			"anyOf": [
-				{ "type": "object",
-				  "properties": {
-					  "accessMe": {"type": "string"}
-				  }
-				},
-				{ "type": "number", "minimum": 0 }
-			  ]
-		}
-	}
-}`
-
-const anyOfObjectMissing = `{
-	"type": "object",
-	"properties": {
-		"AddressLine": { "type": "string" }
-	},
-	"anyOf": [
-		{
-			"type": "object",
-			"properties": {
-				"State":   { "type": "string" },
-				"ZipCode": { "type": "string" }
-			}
-		},
-		{
-			"properties": {
-				"County":   { "type": "string" },
-				"PostCode": { "type": "integer" }
-			}
-		}
-	]
-}`
-
-const allOfArrayOfObjects = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "array",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"items": {
-		"type": "object",
-		"title": "The items schema",
-		"description": "An explanation about the purpose of this instance.",
-		"properties": {
-			"State": {
-				"type": "string"
-			},
-			"ZipCode": {
-				"type": "string"
-			}
-		},
-		"allOf": [{
-				"type": "object",
-				"title": "The b schema",
-				"description": "An explanation about the purpose of this instance.",
-				"properties": {
-					"County": {
-						"type": "string"
-					},
-					"PostCode": {
-						"type": "string"
-					}
-				}
-			},
-			{
-				"type": "object",
-				"title": "The b schema",
-				"description": "An explanation about the purpose of this instance.",
-				"properties": {
-					"Street": {
-						"type": "string"
-					},
-					"House": {
-						"type": "string"
-					}
-				}
-			}
-		]
-	}
-}`
-
-const allOfObjectAndArray = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "object",
-	"title": "My schema",
-	"properties": {
-		"AddressLine1": {
-			"type": "string"
-		},
-		"AddressLine2": {
-			"type": "string"
-		},
-		"City": {
-			"type": "string"
-		}
-	},
-	"allOf": [{
-			"type": "object",
-			"properties": {
-				"State": {
-					"type": "string"
-				},
-				"ZipCode": {
-					"type": "string"
-				}
-			}
-		},
-		{
-			"type": "array",
-			"title": "The b schema",
-			"description": "An explanation about the purpose of this instance.",
-			"items": {
-				"type": "integer",
-				"title": "The items schema",
-				"description": "An explanation about the purpose of this instance."
-			}
-		}
-	]
-}`
-
-const allOfObjectMissing = `{
-	"type": "object",
-	"properties": {
-		"AddressLine": { "type": "string" }
-	},
-	"allOf": [
-		{
-			"type": "object",
-			"properties": {
-				"State":   { "type": "string" },
-				"ZipCode": { "type": "string" }
-			}
-		},
-		{
-			"properties": {
-				"County":   { "type": "string" },
-				"PostCode": { "type": "integer" }
-			}
-		}
-	]
-}`
-
-const allOfArrayDifTypes = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "array",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"allOf": [{
-			"type": "array",
-			"items": [{
-					"type": "string"
-				},
-				{
-					"type": "integer"
-				}
-			]
-		},
-		{
-			"type": "array",
-			"items": [{
-					"type": "string"
-				},
-				{
-					"type": "integer"
-				}
-			]
-		}
-	]
-}`
-
-const allOfArrayInsideObject = `{
-	"type": "object",
-	"properties": {
-		"familyMembers": {
-			"type": "array",
-			"items": {
-				"allOf": [{
-					"type": "object",
-					"properties": {
-						"age": {
-							"type": "integer"
-						},
-						"name": {
-							"type": "string"
-						}
-					}
-				}, {
-					"type": "object",
-					"properties": {
-						"personality": {
-							"type": "string"
-						},
-						"nickname": {
-							"type": "string"
-						}
-					}
-				}]
-			}
-		}
-	}
-}`
-
-const anyOfArrayMissing = `{
-	"type": "array",
-	"anyOf": [
-		{
-			"items": [
-				{"type": "number"},
-				{"type": "string"}]
-            },
-		{	"items": [
-				{"type": "integer"}]
-		}
-	]
-}`
-
-const allOfArrayMissing = `{
-	"type": "array",
-	"allOf": [{
-			"items": [{
-					"type": "integer"
-				},
-				{
-					"type": "integer"
-				}
-			]
-		},
-		{
-			"items": [{
-				"type": "integer"
-			}]
-		}
-	]
-}`
-
-const anyOfSchemaParentVariation = `{
-    "$schema": "http://json-schema.org/draft-04/schema#",
-    "anyOf": [
-        {
-            "type": "object",
-            "properties": {
-                "State":   { "type": "string" },
-                "ZipCode": { "type": "string" }
-            },
-        },
-        {
-            "type": "object",
-            "properties": {
-                "County":   { "type": "string" },
-                "PostCode": { "type": "string" }
-            },
-        }
-    ]
-	}
-}`
-
-const allOfInsideCoreSchema = `{
-	"type": "object",
-	"properties": {
-		"AddressLine": { "type": "string" },
-		"RandomInfo": {
-			"allOf": [
-				{ "type": "object",
-				  "properties": {
-					  "accessMe": {"type": "string"}
-				  }
-				},
-				{ "type": "object",
-					"properties": {
-						"accessYou": {"type": "string"}
-					}}
-			  ]
-		}
-	}
-}`
-
-const allOfArrayDifTypesWithError = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "array",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"allOf": [{
-			"type": "array",
-			"items": [{
-					"type": "string"
-				},
-				{
-					"type": "integer"
-				}
-			]
-		},
-		{
-			"type": "array",
-			"items": [{
-					"type": "boolean"
-				},
-				{
-					"type": "integer"
-				}
-			]
-		}
-	]
-}`
-
-const allOfStringSchema = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "string",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"allOf": [{
-			"type": "string",
-		},
-		{
-			"type": "string",
-		}
-	]
-}`
-
-const allOfIntegerSchema = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "integer",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"allOf": [{
-			"type": "integer",
-		},
-		{
-			"type": "integer",
-		}
-	]
-}`
-
-const allOfBooleanSchema = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "boolean",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"allOf": [{
-			"type": "boolean",
-		},
-		{
-			"type": "boolean",
-		}
-	]
-}`
-
-const allOfTypeErrorSchema = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "string",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"allOf": [{
-			"type": "string",
-		},
-		{
-			"type": "integer",
-		}
-	]
-}`
-
-const allOfStringSchemaWithError = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "string",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"allOf": [{
-			"type": "string",
-		},
-		{
-			"type": "string",
-		},
-		{
-			"type": "boolean",
-		}
-	]
-}`
-
-const allOfSchemaWithParentError = `{
-	"$schema": "http://json-schema.org/draft-04/schema#",
-	"type": "string",
-	"title": "The b schema",
-	"description": "An explanation about the purpose of this instance.",
-	"allOf": [{
-			"type": "integer",
-		},
-		{
-			"type": "integer",
-		}
-	]
-}`
-
-const allOfSchemaWithUnevenArray = `{
-	"type": "array",
-	"allOf": [{
-			"items": [{
-					"type": "integer"
-				},
-				{
-					"type": "integer"
-				}
-			]
-		},
-		{
-			"items": [{
-				"type": "integer"
-			},
-			{
-				"type": "integer"
-			},
-			{
-				"type": "string"
-			}]
-		}
-	]
-}`

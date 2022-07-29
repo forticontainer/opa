@@ -18,10 +18,10 @@ trusted registry.
 package kubernetes.admission                                                # line 1
 
 deny[msg] {                                                                 # line 2
-  input.request.kind.kind == "Pod"                                          # line 3
-  image := input.request.object.spec.containers[_].image                    # line 4
-  not startswith(image, "hooli.com/")                                       # line 5
-  msg := sprintf("image '%v' comes from untrusted registry", [image])       # line 6
+    input.request.kind.kind == "Pod"                                        # line 3
+    image := input.request.object.spec.containers[_].image                  # line 4
+    not startswith(image, "hooli.com/")                                     # line 5
+    msg := sprintf("image '%v' comes from untrusted registry", [image])     # line 6
 }
 ```
 
@@ -187,7 +187,7 @@ Often you don't want to invent new variable names for iteration.  OPA provides t
 
 ### Builtins
 
-On line 5 the *builtin* `startswith` checks if one string is a prefix of the other.  The builtin `sprintf` on line 6 formats a string with arguments.  OPA has 50+ builtins detailed at [openpolicyagent.org/docs/policy-reference](../policy-reference).
+On line 5 the *builtin* `startswith` checks if one string is a prefix of the other.  The builtin `sprintf` on line 6 formats a string with arguments.  OPA has 150+ builtins detailed in [the Policy Reference](../policy-reference/#built-in-functions).
 Builtins let you analyze and manipulate:
 
 * Numbers, Strings, Regexs, Networks
@@ -358,9 +358,7 @@ request:
                 port:
                   number: 443
 </code></pre></div>
-
-
-<br>
+</div>
 
 ## Detailed Admission Control Flow
 
@@ -490,27 +488,28 @@ package system
 
 import data.kubernetes.admission
 
-main = {
+main := {
   "apiVersion": "admission.k8s.io/v1",
   "kind": "AdmissionReview",
   "response": response,
 }
 
-default uid = ""
+default uid := ""
 
-uid = input.request.uid
+uid := input.request.uid
 
-response = {
+response := {
     "allowed": false,
     "uid": uid,
     "status": {
         "message": reason,
     },
 } {
-    reason = concat(", ", admission.deny)
+    reason := concat(", ", admission.deny)
     reason != ""
 }
-else = {"allowed": true, "uid": uid}
+
+else := {"allowed": true, "uid": uid}
 ```
 
 The `system.main` policy MUST generate an **AdmissionReview** object containing

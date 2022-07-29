@@ -40,6 +40,9 @@ type Options struct {
 	// registered with the OPA SDK instance.
 	Plugins map[string]plugins.Factory
 
+	// When calling the sdk the user can specify an opa id so that repeat calls to the sdk don't have a unique opa id
+	ID string
+
 	config []byte
 	block  bool
 }
@@ -61,12 +64,16 @@ func (o *Options) init() error {
 		o.ConsoleLogger = l
 	}
 
-	bs, err := ioutil.ReadAll(o.Config)
-	if err != nil {
-		return err
+	if o.Config == nil {
+		o.config = []byte("{}")
+	} else {
+		bs, err := ioutil.ReadAll(o.Config)
+		if err != nil {
+			return err
+		}
+		o.config = bs
 	}
 
-	o.config = bs
 	return nil
 }
 

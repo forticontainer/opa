@@ -26,6 +26,7 @@ import (
 
 	"github.com/open-policy-agent/opa/ast"
 	"github.com/open-policy-agent/opa/format"
+	"github.com/open-policy-agent/opa/internal/future"
 	pr "github.com/open-policy-agent/opa/internal/presentation"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/profiler"
@@ -38,6 +39,7 @@ import (
 // REPL represents an instance of the interactive shell.
 type REPL struct {
 	output  io.Writer
+	stderr  io.Writer
 	store   storage.Store
 	runtime *ast.Term
 
@@ -48,6 +50,7 @@ type REPL struct {
 	metrics             metrics.Metrics
 	profiler            bool
 	strictBuiltinErrors bool
+	capabilities        *ast.Capabilities
 
 	// TODO(tsandall): replace this state with rule definitions
 	// inside the default module.
@@ -91,6 +94,7 @@ func New(store storage.Store, historyPath string, output io.Writer, outputFormat
 		output:       output,
 		store:        store,
 		modules:      map[string]*ast.Module{},
+		capabilities: ast.CapabilitiesForThisVersion(),
 		outputFormat: outputFormat,
 		explain:      explainOff,
 		historyPath:  historyPath,
@@ -101,6 +105,11 @@ func New(store storage.Store, historyPath string, output io.Writer, outputFormat
 		prettyLimit:  defaultPrettyLimit,
 		target:       compile.TargetRego,
 	}
+}
+
+func (r *REPL) WithCapabilities(capabilities *ast.Capabilities) *REPL {
+	r.capabilities = capabilities
+	return r
 }
 
 func defaultModule() *ast.Module {
@@ -123,6 +132,11 @@ func (r *REPL) initModule(ctx context.Context) error {
 		return nil
 	}
 	return r.evalStatement(ctx, defaultPackage())
+}
+
+func (r *REPL) WithStderrWriter(w io.Writer) *REPL {
+	r.stderr = w
+	return nil
 }
 
 // Loop will run until the user enters "exit", Ctrl+C, Ctrl+D, or an unexpected error occurs.
@@ -322,7 +336,7 @@ func (r *REPL) complete(line string) []string {
 
 	// add imports
 	for _, mod := range r.modules {
-		for _, imp := range mod.Imports {
+		for _, imp := range future.FilterFutureImports(mod.Imports) {
 			path := imp.Name().String()
 			if strings.HasPrefix(path, line) {
 				set[path] = struct{}{}
@@ -681,7 +695,10 @@ func (r *REPL) recompile(ctx context.Context, cpy *ast.Module) error {
 		}
 	}
 
-	compiler := ast.NewCompiler().SetErrorLimit(r.errLimit)
+	compiler := ast.NewCompiler().
+		SetErrorLimit(r.errLimit).
+		WithEnablePrintStatements(true).
+		WithCapabilities(r.capabilities)
 
 	if r.instrument {
 		compiler.WithMetrics(r.metrics)
@@ -702,11 +719,12 @@ func (r *REPL) compileBody(ctx context.Context, compiler *ast.Compiler, body ast
 	qctx := ast.NewQueryContext()
 
 	if r.currentModuleID != "" {
-		qctx = qctx.WithPackage(r.modules[r.currentModuleID].Package).WithImports(r.modules[r.currentModuleID].Imports)
+		qctx = qctx.WithPackage(r.modules[r.currentModuleID].Package).
+			WithImports(future.FilterFutureImports(r.modules[r.currentModuleID].Imports))
 	}
 
-	qc := compiler.QueryCompiler()
-	body, err := qc.WithContext(qctx).Compile(body)
+	qc := compiler.QueryCompiler().WithContext(qctx).WithEnablePrintStatements(true)
+	body, err := qc.Compile(body)
 	return body, qc.TypeEnv(), err
 }
 
@@ -746,7 +764,10 @@ func (r *REPL) compileRule(ctx context.Context, rule *ast.Rule) error {
 		policies[id] = mod
 	}
 
-	compiler := ast.NewCompiler().SetErrorLimit(r.errLimit)
+	compiler := ast.NewCompiler().
+		SetErrorLimit(r.errLimit).
+		WithEnablePrintStatements(true).
+		WithCapabilities(r.capabilities)
 
 	if r.instrument {
 		compiler.WithMetrics(r.metrics)
@@ -781,11 +802,16 @@ func (r *REPL) evalBufferOne(ctx context.Context) error {
 		return nil
 	}
 
+	popts, err := r.parserOptions()
+	if err != nil {
+		return err
+	}
+
 	// The user may enter lines with comments on the end or
 	// multiple lines with comments interspersed. In these cases
 	// the parser will return multiple statements.
 	r.timerStart(metrics.RegoQueryParse)
-	stmts, _, err := ast.ParseStatements("", line)
+	stmts, _, err := ast.ParseStatementsWithOpts("", line, popts)
 	r.timerStop(metrics.RegoQueryParse)
 
 	if err != nil {
@@ -815,8 +841,13 @@ func (r *REPL) evalBufferMulti(ctx context.Context) error {
 		return nil
 	}
 
+	popts, err := r.parserOptions()
+	if err != nil {
+		return err
+	}
+
 	r.timerStart(metrics.RegoQueryParse)
-	stmts, _, err := ast.ParseStatements("", line)
+	stmts, _, err := ast.ParseStatementsWithOpts("", line, popts)
 	r.timerStop(metrics.RegoQueryParse)
 
 	if err != nil {
@@ -830,6 +861,13 @@ func (r *REPL) evalBufferMulti(ctx context.Context) error {
 	}
 
 	return nil
+}
+
+func (r *REPL) parserOptions() (ast.ParserOptions, error) {
+	if r.currentModuleID != "" {
+		return future.ParserOptionsFromFutureImports(r.modules[r.currentModuleID].Imports)
+	}
+	return ast.ParserOptions{}, nil
 }
 
 func (r *REPL) loadCompiler(ctx context.Context) (*ast.Compiler, error) {
@@ -846,7 +884,10 @@ func (r *REPL) loadCompiler(ctx context.Context) (*ast.Compiler, error) {
 		policies[id] = mod
 	}
 
-	compiler := ast.NewCompiler().SetErrorLimit(r.errLimit)
+	compiler := ast.NewCompiler().
+		SetErrorLimit(r.errLimit).
+		WithEnablePrintStatements(true).
+		WithCapabilities(r.capabilities)
 
 	if r.instrument {
 		compiler.WithMetrics(r.metrics)
@@ -940,6 +981,8 @@ func (r *REPL) evalBody(ctx context.Context, compiler *ast.Compiler, input ast.V
 		rego.Runtime(r.runtime),
 		rego.StrictBuiltinErrors(r.strictBuiltinErrors),
 		rego.Target(r.target),
+		rego.EnablePrintStatements(true),
+		rego.PrintHook(topdown.NewPrintHook(r.stderrWriter())),
 	}
 
 	if r.explain != explainOff {
@@ -1006,6 +1049,8 @@ func (r *REPL) evalPartial(ctx context.Context, compiler *ast.Compiler, input as
 		rego.ParsedUnknowns(r.unknowns),
 		rego.Runtime(r.runtime),
 		rego.StrictBuiltinErrors(r.strictBuiltinErrors),
+		rego.EnablePrintStatements(true),
+		rego.PrintHook(topdown.NewPrintHook(r.stderrWriter())),
 	)
 
 	pq, err := eval.Partial(ctx)
@@ -1189,6 +1234,13 @@ func (r *REPL) saveHistory(prompt *liner.State) {
 	}
 }
 
+func (r *REPL) stderrWriter() io.Writer {
+	if r.stderr != nil {
+		return r.stderr
+	}
+	return os.Stderr
+}
+
 type commandDesc struct {
 	name string
 	args []string
@@ -1347,8 +1399,7 @@ func printHelpExamples(output io.Writer, promptSymbol string) {
 
 func printHelpCommands(output io.Writer) {
 
-	all := extra[:]
-	all = append(all, builtin[:]...)
+	all := append(extra[:], builtin[:]...)
 
 	// Compute max length of all command and topic names.
 	names := []string{}
@@ -1443,6 +1494,11 @@ For example:
 
 	# Import "params" defined above.
 	> import input.params
+
+	# Import a future keyword.
+	> import future.keywords.in
+	> 1 in [0, 2, 1]
+	true
 
 	# Define rule that refers to "params".
 	> is_post { params.method = "POST" }

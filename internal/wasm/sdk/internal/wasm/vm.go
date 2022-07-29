@@ -18,9 +18,11 @@ import (
 
 	"github.com/open-policy-agent/opa/ast"
 	sdk_errors "github.com/open-policy-agent/opa/internal/wasm/sdk/opa/errors"
+	"github.com/open-policy-agent/opa/internal/wasm/util"
 	"github.com/open-policy-agent/opa/metrics"
 	"github.com/open-policy-agent/opa/topdown"
 	"github.com/open-policy-agent/opa/topdown/cache"
+	"github.com/open-policy-agent/opa/topdown/print"
 )
 
 // VM is a wrapper around a Wasm VM instance
@@ -29,7 +31,6 @@ type VM struct {
 	engine               *wasmtime.Engine
 	store                *wasmtime.Store
 	instance             *wasmtime.Instance // Pointer to avoid unintented destruction (triggering finalizers within).
-	intHandle            *wasmtime.InterruptHandle
 	policy               []byte
 	abiMajorVersion      int32
 	abiMinorVersion      int32
@@ -72,6 +73,7 @@ func newVM(opts vmOpts, engine *wasmtime.Engine) (*VM, error) {
 	ctx := context.Background()
 	v := &VM{engine: engine}
 	store := wasmtime.NewStore(engine)
+	store.SetEpochDeadline(1)
 	memorytype := wasmtime.NewMemoryType(opts.memoryMin, true, opts.memoryMax)
 	memory, err := wasmtime.NewMemory(store, memorytype)
 	if err != nil {
@@ -99,10 +101,6 @@ func newVM(opts vmOpts, engine *wasmtime.Engine) (*VM, error) {
 	if err != nil {
 		return nil, err
 	}
-	v.intHandle, err = store.InterruptHandle()
-	if err != nil {
-		return nil, fmt.Errorf("get interrupt handle: %w", err)
-	}
 
 	v.abiMajorVersion, v.abiMinorVersion, err = getABIVersion(i, store)
 	if err != nil {
@@ -111,6 +109,9 @@ func newVM(opts vmOpts, engine *wasmtime.Engine) (*VM, error) {
 	if v.abiMajorVersion != int32(1) || (v.abiMinorVersion != int32(1) && v.abiMinorVersion != int32(2)) {
 		return nil, fmt.Errorf("invalid module: unsupported ABI version: %d.%d", v.abiMajorVersion, v.abiMinorVersion)
 	}
+
+	// re-exported import, or just plain export if memory wasn't imported
+	memory = i.GetExport(store, "memory").Memory()
 
 	v.store = store
 	v.instance = i
@@ -171,7 +172,7 @@ func newVM(opts vmOpts, engine *wasmtime.Engine) (*VM, error) {
 	if opts.parsedData != nil {
 		if uint32(memory.DataSize(store))-uint32(v.baseHeapPtr) < uint32(len(opts.parsedData)) {
 			delta := uint32(len(opts.parsedData)) - (uint32(memory.DataSize(store)) - uint32(v.baseHeapPtr))
-			_, err = memory.Grow(store, uint64(Pages(delta)))
+			_, err = memory.Grow(store, uint64(util.Pages(delta)))
 			if err != nil {
 				return nil, err
 			}
@@ -269,15 +270,16 @@ func (i *VM) Eval(ctx context.Context,
 	metrics metrics.Metrics,
 	seed io.Reader,
 	ns time.Time,
-	iqbCache cache.InterQueryCache) ([]byte, error) {
+	iqbCache cache.InterQueryCache,
+	ph print.Hook,
+	capabilities *ast.Capabilities) ([]byte, error) {
 	if i.abiMinorVersion < int32(2) {
-		return i.evalCompat(ctx, entrypoint, input, metrics, seed, ns, iqbCache)
+		return i.evalCompat(ctx, entrypoint, input, metrics, seed, ns, iqbCache, ph, capabilities)
 	}
 
 	metrics.Timer("wasm_vm_eval").Start()
 	defer metrics.Timer("wasm_vm_eval").Stop()
 
-	mem := i.memory.UnsafeData(i.store)
 	inputAddr, inputLen := int32(0), int32(0)
 
 	// NOTE: we'll never free the memory used for the input string during
@@ -303,6 +305,16 @@ func (i *VM) Eval(ctx context.Context,
 		}
 		inputLen = int32(len(raw))
 		inputAddr = i.evalHeapPtr
+
+		rest := inputAddr + inputLen - int32(i.memory.DataSize(i.store))
+		if rest > 0 { // need to grow memory
+			_, err := i.memory.Grow(i.store, uint64(util.Pages(uint32(rest))))
+			if err != nil {
+				return nil, fmt.Errorf("input: %w (max pages %d)", err, i.memoryMax)
+			}
+		}
+		mem := i.memory.UnsafeData(i.store)
+
 		heapPtr += inputLen
 		copy(mem[inputAddr:inputAddr+inputLen], raw)
 
@@ -313,7 +325,7 @@ func (i *VM) Eval(ctx context.Context,
 	// make use of it (e.g. `http.send`); and it will spawn a go routine
 	// cancelling the builtins that use topdown.Cancel, when the context is
 	// cancelled.
-	i.dispatcher.Reset(ctx, seed, ns, iqbCache)
+	i.dispatcher.Reset(ctx, seed, ns, iqbCache, ph, capabilities)
 
 	metrics.Timer("wasm_vm_eval_call").Start()
 	resultAddr, err := i.evalOneOff(ctx, int32(entrypoint), i.dataAddr, inputAddr, inputLen, heapPtr)
@@ -341,7 +353,9 @@ func (i *VM) evalCompat(ctx context.Context,
 	metrics metrics.Metrics,
 	seed io.Reader,
 	ns time.Time,
-	iqbCache cache.InterQueryCache) ([]byte, error) {
+	iqbCache cache.InterQueryCache,
+	ph print.Hook,
+	capabilities *ast.Capabilities) ([]byte, error) {
 	metrics.Timer("wasm_vm_eval").Start()
 	defer metrics.Timer("wasm_vm_eval").Stop()
 
@@ -351,7 +365,7 @@ func (i *VM) evalCompat(ctx context.Context,
 	// make use of it (e.g. `http.send`); and it will spawn a go routine
 	// cancelling the builtins that use topdown.Cancel, when the context is
 	// cancelled.
-	i.dispatcher.Reset(ctx, seed, ns, iqbCache)
+	i.dispatcher.Reset(ctx, seed, ns, iqbCache, ph, capabilities)
 
 	err := i.setHeapState(ctx, i.evalHeapPtr)
 	if err != nil {
@@ -443,17 +457,17 @@ func (i *VM) SetPolicyData(ctx context.Context, opts vmOpts) error {
 	if opts.parsedData != nil {
 		if uint32(i.memory.DataSize(i.store))-uint32(i.baseHeapPtr) < uint32(len(opts.parsedData)) {
 			delta := uint32(len(opts.parsedData)) - (uint32(i.memory.DataSize(i.store)) - uint32(i.baseHeapPtr))
-			_, err := i.memory.Grow(i.store, uint64(Pages(delta)))
+			_, err := i.memory.Grow(i.store, uint64(util.Pages(delta)))
 			if err != nil {
 				return err
 			}
 		}
 		mem := i.memory.UnsafeData(i.store)
-		for src, dest := 0, i.baseHeapPtr; src < len(opts.parsedData); src, dest = src+1, dest+1 {
-			mem[dest] = opts.parsedData[src]
-		}
+		len := int32(len(opts.parsedData))
+		copy(mem[i.baseHeapPtr:i.baseHeapPtr+len], opts.parsedData)
 		i.dataAddr = opts.parsedDataAddr
-		i.evalHeapPtr = i.baseHeapPtr + int32(len(opts.parsedData))
+
+		i.evalHeapPtr = i.baseHeapPtr + int32(len)
 		err := i.setHeapState(ctx, i.evalHeapPtr)
 		if err != nil {
 			return err
@@ -696,7 +710,7 @@ func callOrCancel(ctx context.Context, vm *VM, name string, args ...int32) (inte
 	go func() {
 		select {
 		case <-ctx.Done():
-			vm.intHandle.Interrupt()
+			vm.store.Engine.IncrementEpoch()
 		case <-done:
 		}
 		close(ctxdone)
@@ -729,9 +743,8 @@ func callOrCancel(ctx context.Context, vm *VM, name string, args ...int32) (inte
 		// if last err was trap, extract information
 		var t *wasmtime.Trap
 		if errors.As(err, &t) {
-			code := t.Code()
-			if code != nil && *code == wasmtime.Interrupt {
-				return 0, sdk_errors.New(sdk_errors.CancelledErr, getStack(t.Frames(), "interrupted"))
+			if t.Message() == "epoch deadline reached during execution" {
+				return 0, sdk_errors.New(sdk_errors.CancelledErr, "interrupted")
 			}
 			return 0, sdk_errors.New(sdk_errors.InternalErr, getStack(t.Frames(), "trapped"))
 		}

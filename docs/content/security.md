@@ -14,7 +14,7 @@ authorization so that:
 - Traffic between OPA and clients is encrypted.
 - Clients verify the OPA API endpoint identity.
 - OPA verifies client identities.
-- Clients are only granted access to specific APIs or sections of [The `data` Document](../#the-data-document).
+- Clients are only granted access to specific APIs or sections of [The `data` Document](../philosophy/#the-opa-document-model).
 
 ## TLS and HTTPS
 
@@ -26,6 +26,12 @@ startup:
 
 OPA will exit immediately with a non-zero status code if only one of these flags
 is specified.
+
+The server can track the certificate and key files' contents, and reload them if necessary:
+
+- ``--tls-cert-refresh-period=<duration>`` specifies how often OPA should check the TLS certificate and
+  private key file for changes (defaults to 0s, disabling periodic refresh). This argument accepts
+  any duration, such as "30s", "5m" or "24h".
 
 Note that for using TLS-based authentication, a CA cert file can be provided:
 
@@ -78,8 +84,9 @@ curl http://localhost:8181/v1/data
 curl -k https://localhost:8181/v1/data
 ```
 
-> We have to use cURL's `-k/--insecure` flag because we are using a
-> self-signed certificate.
+{{< info >}}
+We have to use cURL's `-k/--insecure` flag because we are using a self-signed certificate.
+{{< /info >}}
 
 ## Authentication and Authorization
 
@@ -112,7 +119,7 @@ value will be undefined when the authorization policy is evaluated.
 - Client TLS certificates: Client TLS authentication is enabled by starting
 OPA with ``--authentication=tls``. When this authentication mode is enabled,
 OPA will require all clients to provide a client certificate. It is verified
-against the CA certificate(s) provided via `--tls-ca-cert-path`. Upon successful
+against the CA certificate(s) provided via `--tls-ca-cert-file`. Upon successful
 verification, the `input.identity` value is set to the TLS certificate's
 subject.
 
@@ -133,7 +140,7 @@ must be provided on startup. The authorization policy must be structured as foll
 # system.authz as follows:
 package system.authz
 
-default allow = false  # Reject requests by default.
+default allow := false  # Reject requests by default.
 
 allow {
   # Logic to authorize request goes here.
@@ -186,7 +193,7 @@ policy:
     #
     # Example header check:
     #
-    #   input.headers["X-Custom"][_] = "mysecret"
+    #   input.headers["X-Custom"][_] == "mysecret"
     #
     # Header keys follow canonical MIME form. The first character and any
     # characters following a hyphen are uppercase. The rest are lowercase.
@@ -226,7 +233,7 @@ identity:
 ```live:system_authz_secret:module:read_only
 package system.authz
 
-default allow = false           # Reject requests by default.
+default allow := false           # Reject requests by default.
 
 allow {                         # Allow request if...
     "secret" == input.identity  # Identity is the secret root key.
@@ -276,16 +283,16 @@ follows:
 ```live:system_authz_object_resp:module:read_only
 package system.authz
 
-default allow = {
+default allow := {
     "allowed": false,
     "reason": "unauthorized resource access"
 }
 
-allow = { "allowed": true } {   # Allow request if...
+allow := { "allowed": true } {   # Allow request if...
     "secret" == input.identity  # identity is the secret root key.
 }
 
-allow = { "allowed": false, "reason": reason } {
+allow := { "allowed": false, "reason": reason } {
     not input.identity
     reason := "no identity provided"
 }
@@ -300,7 +307,7 @@ validate the identity:
 package system.authz
 
 # Tokens may defined in policy or pushed into OPA as data.
-tokens = {
+tokens := {
     "my-secret-token-foo": {
         "roles": ["admin"]
     },
@@ -312,7 +319,7 @@ tokens = {
     }
 }
 
-default allow = false           # Reject requests by default.
+default allow := false           # Reject requests by default.
 
 allow {                         # Allow request if...
     input.identity == "secret"  # Identity is the secret root key.
@@ -330,7 +337,7 @@ documents:
 package system.authz
 
 # Rights may be defined in policy or pushed into OPA as data.
-rights = {
+rights := {
     "admin": {
         "path": "*"
     },
@@ -343,7 +350,7 @@ rights = {
 }
 
 # Tokens may be defined in policy or pushed into OPA as data.
-tokens = {
+tokens := {
     "my-secret-token-foo": {
         "roles": ["admin"]
     },
@@ -355,7 +362,7 @@ tokens = {
     }
 }
 
-default allow = false               # Reject requests by default.
+default allow := false               # Reject requests by default.
 
 allow {                             # Allow request if...
     some right
@@ -434,11 +441,11 @@ We also create a simple authorization policy file, called `check.rego`:
 package system.authz
 
 # client_cns may defined in policy or pushed into OPA as data.
-client_cns = {
+client_cns := {
 	"my-client": true
 }
 
-default allow = false
+default allow := false
 
 allow {                                        # Allow request if
 	split(input.identity, "=", ["CN", cn]) # the cert subject is a CN, and
@@ -543,12 +550,12 @@ clients access to the default policy decision, i.e., `POST /`:
 package system.authz
 
 # Deny access by default.
-default allow = false
+default allow := false
 
 # Allow anonymous access to the default policy decision.
 allow {
-    input.method = "POST"
-    input.path = [""]
+    input.method == "POST"
+    input.path == [""]
 }
 ```
 

@@ -263,33 +263,33 @@ func TestObjectFilter(t *testing.T) {
 	}
 }
 
-func TestObjectInsertKeepsSorting(t *testing.T) {
-	keysSorted := func(o *object) func(int, int) bool {
+func TestSetInsertKeepsKeysSorting(t *testing.T) {
+	keysSorted := func(s *set) func(int, int) bool {
 		return func(i, j int) bool {
-			return Compare(o.keys[i].key, o.keys[j].key) < 0
+			return Compare(s.keys[i], s.keys[j]) < 0
 		}
 	}
 
-	obj := NewObject(
-		[2]*Term{StringTerm("d"), IntNumberTerm(4)},
-		[2]*Term{StringTerm("b"), IntNumberTerm(2)},
-		[2]*Term{StringTerm("a"), IntNumberTerm(1)},
+	s0 := NewSet(
+		StringTerm("d"),
+		StringTerm("b"),
+		StringTerm("a"),
 	)
-	o := obj.(*object)
-	act := sort.SliceIsSorted(o.keys, keysSorted(o))
+	s := s0.(*set)
+	act := sort.SliceIsSorted(s.keys, keysSorted(s))
 	if exp := true; act != exp {
 		t.Errorf("SliceIsSorted: expected %v, got %v", exp, act)
-		for i := range o.keys {
-			t.Logf("elem[%d]: %v", i, o.keys[i].key)
+		for i := range s.keys {
+			t.Logf("elem[%d]: %v", i, s.keys[i])
 		}
 	}
 
-	obj.Insert(StringTerm("c"), IntNumberTerm(3))
-	act = sort.SliceIsSorted(o.keys, keysSorted(o))
+	s0.Add(StringTerm("c"))
+	act = sort.SliceIsSorted(s.keys, keysSorted(s))
 	if exp := true; act != exp {
 		t.Errorf("SliceIsSorted: expected %v, got %v", exp, act)
-		for i := range o.keys {
-			t.Logf("elem[%d]: %v", i, o.keys[i].key)
+		for i := range s.keys {
+			t.Logf("elem[%d]: %v", i, s.keys[i])
 		}
 	}
 }
@@ -387,7 +387,7 @@ func TestFind(t *testing.T) {
 	}
 }
 
-func TestHash(t *testing.T) {
+func TestHashObject(t *testing.T) {
 
 	doc := `{"a": [[true, {"b": [null]}, {"c": "d"}]], "e": {100: a[i].b}, "k": ["foo" | true], "o": {"foo": "bar" | true}, "sc": {"foo" | true}, "s": {1, 2, {3, 4}}, "big": 1e+1000}`
 
@@ -399,6 +399,77 @@ func TestHash(t *testing.T) {
 
 	if obj1.Hash() != obj2.Hash() {
 		t.Errorf("Expected hash codes to be equal")
+	}
+
+	// Calculate hash like we did before moving the caching to create/update:
+	obj := obj1.(*object)
+	exp := 0
+	for h, curr := range obj.elems {
+		for ; curr != nil; curr = curr.next {
+			exp += h
+			exp += curr.value.Hash()
+		}
+	}
+
+	if act := obj1.Hash(); exp != act {
+		t.Errorf("expected %v, got %v", exp, act)
+	}
+}
+
+func TestHashArray(t *testing.T) {
+
+	doc := `[{"a": [[true, {"b": [null]}, {"c": "d"}]]}, 100, true, [a[i].b], {100: a[i].b}, ["foo" | true], {"foo": "bar" | true}, {"foo" | true}, {1, 2, {3, 4}}, 1e+1000]`
+
+	stmt1 := MustParseStatement(doc)
+	stmt2 := MustParseStatement(doc)
+
+	arr1 := stmt1.(Body)[0].Terms.(*Term).Value.(*Array)
+	arr2 := stmt2.(Body)[0].Terms.(*Term).Value.(*Array)
+
+	if arr1.Hash() != arr2.Hash() {
+		t.Errorf("Expected hash codes to be equal")
+	}
+
+	// Calculate hash like we did before moving the caching to create/update:
+	exp := termSliceHash(arr1.elems)
+
+	if act := arr1.Hash(); exp != act {
+		t.Errorf("expected %v, got %v", exp, act)
+	}
+
+	for j := 0; j < arr1.Len(); j++ {
+		for i := 0; i <= j; i++ {
+			slice := arr1.Slice(i, j)
+			exp := termSliceHash(slice.elems)
+			if act := slice.Hash(); exp != act {
+				t.Errorf("arr1[%d:%d]: expected %v, got %v", i, j, exp, act)
+			}
+		}
+	}
+}
+
+func TestHashSet(t *testing.T) {
+
+	doc := `{{"a": [[true, {"b": [null]}, {"c": "d"}]]}, 100, 100, 100, true, [a[i].b], {100: a[i].b}, ["foo" | true], {"foo": "bar" | true}, {"foo" | true}, {1, 2, {3, 4}}, 1e+1000}`
+
+	stmt1 := MustParseStatement(doc)
+	stmt2 := MustParseStatement(doc)
+
+	set1 := stmt1.(Body)[0].Terms.(*Term).Value.(Set)
+	set2 := stmt2.(Body)[0].Terms.(*Term).Value.(Set)
+
+	if set1.Hash() != set2.Hash() {
+		t.Errorf("Expected hash codes to be equal")
+	}
+
+	// Calculate hash like we did before moving the caching to create/update:
+	exp := 0
+	set1.Foreach(func(x *Term) {
+		exp += x.Hash()
+	})
+
+	if act := set1.Hash(); exp != act {
+		t.Errorf("expected %v, got %v", exp, act)
 	}
 }
 
@@ -814,12 +885,13 @@ func TestSetCopy(t *testing.T) {
 	cpy := orig.Copy()
 	vis := NewGenericVisitor(func(x interface{}) bool {
 		if Compare(IntNumberTerm(2), x) == 0 {
-			x.(*Term).Value = String("modified")
+			// NOTE(sr): If we mess up the rank, our sort-on-insert approach fails us
+			x.(*Term).Value = Number("2.5")
 		}
 		return false
 	})
 	vis.Walk(orig)
-	expOrig := MustParseTerm(`{1, "modified", 3}`)
+	expOrig := MustParseTerm(`{1,2.5,3}`)
 	expCpy := MustParseTerm(`{1,2,3}`)
 	if !expOrig.Equal(orig) {
 		t.Errorf("Expected %v but got %v", expOrig, orig)

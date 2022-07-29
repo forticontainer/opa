@@ -47,7 +47,7 @@ re-deployed.
 ### Preview Markdown `content` (*.md)
 
 The majority of this can be done with any markdown renderer (typically built into or
-a via plug-in for IDE's and editors). The rendered output will be very similar to what Hugo will
+via a plug-in for IDEs and editors). The rendered output will be very similar to what Hugo will
 generate.
  
 > This excludes the Hugo shortcodes (places with `{{< SHORT_CODE >}}` in the markdown.
@@ -80,6 +80,14 @@ using the non-extended version:
 error: failed to transform resource: TOCSS: failed to transform "sass/style.sass" (text/x-sass): this feature is not available in your current Hugo version
 ```
 
+Please also note that the current version of Hugo (e.g. installed with `brew install hugo`) is 
+not compatible with the docs. If you get errors like this, it means that you're using the 
+wrong version:
+
+```
+ERROR ... execute of template failed: template: partials/docs/sidenav.html:11:18: executing "partials/docs/sidenav.html" at <.URL>: can't evaluate field URL in type *hugolib.pageState
+```
+
 #### Remote Preview on Netlify
 
 This option provides the best preview of the site content, using the exact same infrastructure as the production website.
@@ -96,7 +104,7 @@ This option provides the best preview of the site content, using the exact same 
    user account (which should have been configured in the previous step).
    
 1) Netlify will then upload the built content and serve it via their CDN. A URL to the preview will be given in the
-   CLI console output.
+   CLI console output. Be sure to select the `edge` version within the Documentation pages to see your reflected changes in the remote site.
 
 
 #### Local Preview via `netlify dev`
@@ -330,8 +338,10 @@ The future plan is to use the following labels to generate categories of integra
 As of now the labels are only displayed for each entry.
 
 ## Logos
-For each entry in the [integrations.yaml](./website/data/integrations.yaml) integrations section the UI will use a
-PNG logo with the same name as the key from [./website/static/img/logos/integrations](./website/static/img/logos/integrations)
+
+For each entry in the [integrations.yaml](./website/data/integrations.yaml)
+integrations section the UI will use a PNG or SVG logo with the same name as the key from
+[./website/static/img/logos/integrations](./website/static/img/logos/integrations)
 
 For example:
 
@@ -342,5 +352,15 @@ integrations:
 ```
 
 Would need a file called `my-cool-integration.png` at `./website/static/img/logos/integrations/my-cool-integration.png`
+(or `my-cool-integration.svg` in the same location).
 
 If it doesn't exist the OPA logo will be shown by default.
+
+## Google Analytics
+With the addition of the feedback button, we are now able to see how many users found a particular page of the docs useful.
+
+To view the metrics you will need access to [Google Analytics](https://analytics.google.com/analytics/web/).
+
+Feedback responses can be found in the right hand tree under Behavior -> Events -> Top Events.
+
+From here you can set the desired time frame you wish to monitor. Then drill down into the helpful category to see the specific pages and how many clicks they received. 

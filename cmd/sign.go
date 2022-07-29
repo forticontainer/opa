@@ -15,7 +15,6 @@ import (
 	"path/filepath"
 	"strings"
 
-	"github.com/pkg/errors"
 	"github.com/spf13/cobra"
 
 	"github.com/open-policy-agent/opa/bundle"
@@ -128,7 +127,7 @@ To include additional claims in the payload use the --claims-file flag to provid
 a JSON file containing optional claims.
 
 For more information on the format of the ".signatures.json" file see
-https://www.openpolicyagent.org/docs/latest/management/#signature-format.
+https://www.openpolicyagent.org/docs/latest/management-bundles/#signature-format.
 `,
 		PreRunE: func(Cmd *cobra.Command, args []string) error {
 			return validateSignParams(args, cmdParams)
@@ -192,7 +191,7 @@ func readBundleFiles(loaders []initload.BundleLoader, h bundle.SignatureHasher) 
 			}
 
 			if err != nil {
-				return files, errors.Wrap(err, "bundle read failed")
+				return files, fmt.Errorf("bundle read failed: %w", err)
 			}
 
 			// skip existing signatures file
